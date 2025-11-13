@@ -1,0 +1,15 @@
+# Python 
+__pycache__/ 
+*.py[cod] 
+*$py.class 
+*.so 
+.Python 
+venv/ 
+.venv/ 
+ENV/ 
+.ipynb_checkpoints/ 
+*.npz 
+*.png 
+*.jpg 
+.DS_Store 
+.vscode/ 
