@@ -1,7 +1,6 @@
 """
 Baseline Method 2: SVI (Stochastic Volatility Inspired) Parametrization
 Industry-standard approach for volatility smile fitting
-References: Gatheral (2004), Gatheral & Jacquier (2014)
 """
 
 import numpy as np
