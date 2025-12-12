@@ -11,27 +11,8 @@ from scipy.stats import norm
 
 class GaussianProcessVolatility:
     """
-    Volatility surface interpolation using Gaussian Processes.
-    
     This baseline method provides fast, probabilistic interpolation with uncertainty
     quantification. However, it does not enforce arbitrage-free constraints.
-    
-    Advantages:
-        - Fast to implement and train
-        - Provides uncertainty quantification via posterior variance
-        - Reasonable baseline for comparison
-    
-    Disadvantages:
-        - No arbitrage-free guarantees
-        - Computational complexity scales as O(n³) with number of observations
-        - May produce arbitrageable surfaces in regions with sparse data
-    
-    Parameters
-    ----------
-    kernel_type : str, default='rbf'
-        Type of kernel function: 'rbf' for Radial Basis Function or 'matern' for Matérn
-    length_scale : float, default=1.0
-        Characteristic length scale of the kernel
     """
     
     def __init__(self, kernel_type='rbf', length_scale=1.0):
@@ -289,3 +270,386 @@ if __name__ == "__main__":
     plt.show()
     
     print("\nResults saved to: data/synthetic/gp_baseline_results.png")
+
+class GaussianProcessRegression:
+    """
+    Gaussian Process Regression for conditional volatility estimation.
+    
+    This class is designed for use in validation experiments where we want to
+    estimate conditional distributions of volatility given observed price paths.
+    
+    Key difference from GaussianProcessVolatility:
+    - Input: Price paths (time series)
+    - Output: Conditional volatility distribution (mean and variance)
+    
+    Parameters
+    ----------
+    kernel_type : str, default='rbf'
+        Type of kernel: 'rbf' or 'matern'
+    length_scale : float, default=1.0
+        Kernel length scale
+    alpha : float, default=1e-6
+        Noise level (regularization)
+    """
+    
+    def __init__(self, kernel_type='rbf', length_scale=1.0, alpha=1e-6):
+        if kernel_type == 'rbf':
+            kernel = ConstantKernel(1.0) * RBF(length_scale=length_scale)
+        elif kernel_type == 'matern':
+            kernel = ConstantKernel(1.0) * Matern(length_scale=length_scale, nu=1.5)
+        else:
+            raise ValueError(f"Unknown kernel: {kernel_type}")
+        
+        self.gp = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=alpha,
+            n_restarts_optimizer=10
+        )
+        
+        self.is_fitted = False
+        
+    def fit(self, X_train, y_train):
+        """
+        Train GP on path-to-volatility mapping.
+        
+        Parameters
+        ----------
+        X_train : ndarray, shape (n_samples, n_timesteps)
+            Observed price paths
+        y_train : ndarray, shape (n_samples, n_timesteps)
+            Corresponding volatility paths
+        """
+        # Flatten to use last volatility as target
+        n_samples, n_timesteps = X_train.shape
+        
+        # Use entire price path as features
+        X_flat = X_train  # shape (n_samples, n_timesteps)
+        
+        # Target: final volatility
+        y_flat = y_train[:, -1]  # shape (n_samples,)
+        
+        print(f"Fitting GP on {len(X_flat)} samples with {n_timesteps} features...")
+        self.gp.fit(X_flat, y_flat)
+        
+        self.is_fitted = True
+        self.n_timesteps = n_timesteps
+        print(f"GP fitted successfully")
+        
+    def predict(self, X_test, return_std=True):
+        """
+        Predict conditional volatility given price paths.
+        
+        Parameters
+        ----------
+        X_test : ndarray, shape (n_samples, n_timesteps)
+            Price paths for prediction
+        return_std : bool, default=True
+            Whether to return predictive standard deviation
+            
+        Returns
+        -------
+        mean : ndarray, shape (n_samples, n_timesteps)
+            Predicted mean volatility path (last value is prediction)
+        std : ndarray, shape (n_samples, n_timesteps)
+            Predictive standard deviation (if return_std=True)
+        """
+        if not self.is_fitted:
+            raise ValueError("Must fit GP first")
+        
+        n_samples, n_timesteps = X_test.shape
+        
+        if n_timesteps != self.n_timesteps:
+            raise ValueError(f"Expected {self.n_timesteps} timesteps, got {n_timesteps}")
+        
+        # Predict final volatility for each sample
+        if return_std:
+            y_pred, y_std = self.gp.predict(X_test, return_std=True)
+        else:
+            y_pred = self.gp.predict(X_test)
+            y_std = None
+        
+        # Expand to full path (GP only predicts final value)
+        # For intermediate times, return NaN or interpolate
+        mean_full = np.full((n_samples, n_timesteps), np.nan)
+        mean_full[:, -1] = y_pred
+        
+        if return_std:
+            std_full = np.full((n_samples, n_timesteps), np.nan)
+            std_full[:, -1] = y_std
+            return mean_full, std_full
+        else:
+            return mean_full
+
+
+class GaussianProcessRegression:
+    """
+    Gaussian Process Regression for conditional volatility estimation.
+    
+    This class is designed for use in validation experiments where we want to
+    estimate conditional distributions of volatility given observed price paths.
+    
+    Key difference from GaussianProcessVolatility:
+    - Input: Price paths (time series)
+    - Output: Conditional volatility distribution (mean and variance)
+    
+    Parameters
+    ----------
+    kernel_type : str, default='rbf'
+        Type of kernel: 'rbf' or 'matern'
+    length_scale : float, default=1.0
+        Kernel length scale
+    alpha : float, default=1e-6
+        Noise level (regularization)
+    """
+    
+    def __init__(self, kernel_type='rbf', length_scale=1.0, alpha=1e-6):
+        if kernel_type == 'rbf':
+            kernel = ConstantKernel(1.0) * RBF(length_scale=length_scale)
+        elif kernel_type == 'matern':
+            kernel = ConstantKernel(1.0) * Matern(length_scale=length_scale, nu=1.5)
+        else:
+            raise ValueError(f"Unknown kernel: {kernel_type}")
+        
+        self.gp = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=alpha,
+            n_restarts_optimizer=10
+        )
+        
+        self.is_fitted = False
+        
+    def fit(self, X_train, y_train):
+        """
+        Train GP on path-to-volatility mapping.
+        
+        Parameters
+        ----------
+        X_train : ndarray, shape (n_samples, n_timesteps)
+            Observed price paths
+        y_train : ndarray, shape (n_samples, n_timesteps)
+            Corresponding volatility paths
+        """
+        # Flatten to use last volatility as target
+        n_samples, n_timesteps = X_train.shape
+        
+        # Use entire price path as features
+        X_flat = X_train  # shape (n_samples, n_timesteps)
+        
+        # Target: final volatility
+        y_flat = y_train[:, -1]  # shape (n_samples,)
+        
+        print(f"Fitting GP on {len(X_flat)} samples with {n_timesteps} features...")
+        self.gp.fit(X_flat, y_flat)
+        
+        self.is_fitted = True
+        self.n_timesteps = n_timesteps
+        print(f"GP fitted successfully")
+        
+    def predict(self, X_test, return_std=True):
+        """
+        Predict conditional volatility given price paths.
+        
+        Parameters
+        ----------
+        X_test : ndarray, shape (n_samples, n_timesteps)
+            Price paths for prediction
+        return_std : bool, default=True
+            Whether to return predictive standard deviation
+            
+        Returns
+        -------
+        mean : ndarray, shape (n_samples, n_timesteps)
+            Predicted mean volatility path (last value is prediction)
+        std : ndarray, shape (n_samples, n_timesteps)
+            Predictive standard deviation (if return_std=True)
+        """
+        if not self.is_fitted:
+            raise ValueError("Must fit GP first")
+        
+        n_samples, n_timesteps = X_test.shape
+        
+        if n_timesteps != self.n_timesteps:
+            raise ValueError(f"Expected {self.n_timesteps} timesteps, got {n_timesteps}")
+        
+        # Predict final volatility for each sample
+        if return_std:
+            y_pred, y_std = self.gp.predict(X_test, return_std=True)
+        else:
+            y_pred = self.gp.predict(X_test)
+            y_std = None
+        
+        # Expand to full path (GP only predicts final value)
+        # For intermediate times, return NaN or interpolate
+        mean_full = np.full((n_samples, n_timesteps), np.nan)
+        mean_full[:, -1] = y_pred
+        
+        if return_std:
+            std_full = np.full((n_samples, n_timesteps), np.nan)
+            std_full[:, -1] = y_std
+            return mean_full, std_full
+        else:
+            return mean_full
+
+
+class GaussianProcessVolatility:
+    """
+    Volatility surface interpolation using Gaussian Processes.
+    
+    This baseline method provides fast, probabilistic interpolation with uncertainty
+    quantification. However, it does not enforce arbitrage-free constraints.
+    
+    Advantages:
+        - Fast to implement and train
+        - Provides uncertainty quantification via posterior variance
+        - Reasonable baseline for comparison
+    
+    Disadvantages:
+        - No arbitrage-free guarantees
+        - Computational complexity scales as O(n³) with number of observations
+        - May produce arbitrageable surfaces in regions with sparse data
+    
+    Parameters
+    ----------
+    kernel_type : str, default='rbf'
+        Type of kernel function: 'rbf' for Radial Basis Function or 'matern' for Matérn
+    length_scale : float, default=1.0
+        Characteristic length scale of the kernel
+    """
+    
+    def __init__(self, kernel_type='rbf', length_scale=1.0):
+        if kernel_type == 'rbf':
+            kernel = ConstantKernel(1.0) * RBF(length_scale=length_scale)
+        elif kernel_type == 'matern':
+            kernel = ConstantKernel(1.0) * Matern(length_scale=length_scale, nu=1.5)
+        else:
+            raise ValueError(f"Unknown kernel: {kernel_type}")
+        
+        self.gp = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=1e-6,
+            n_restarts_optimizer=10
+        )
+        
+        self.is_fitted = False
+        
+    def fit(self, strikes_norm, maturities, impl_vols):
+        """
+        Train Gaussian Process on observed volatility data.
+        
+        Parameters
+        ----------
+        strikes_norm : ndarray, shape (n_strikes,)
+            Normalized strike prices (K/S0)
+        maturities : ndarray, shape (n_maturities,)
+            Option maturities in years
+        impl_vols : ndarray, shape (n_maturities, n_strikes)
+            Observed implied volatilities
+        """
+        X_obs = []
+        y_obs = []
+        
+        for i, T in enumerate(maturities):
+            for j, K in enumerate(strikes_norm):
+                X_obs.append([T, K])
+                y_obs.append(impl_vols[i, j])
+        
+        X_obs = np.array(X_obs)
+        y_obs = np.array(y_obs)
+        
+        print(f"Fitting GP on {len(X_obs)} observations...")
+        self.gp.fit(X_obs, y_obs)
+        
+        self.is_fitted = True
+        print(f"GP fitted successfully. Kernel: {self.gp.kernel_}")
+        
+    def predict(self, strikes_norm, maturities, return_std=False):
+        """
+        Predict implied volatilities at new points.
+        
+        Parameters
+        ----------
+        strikes_norm : ndarray, shape (n_strikes,)
+            Normalized strikes for prediction
+        maturities : ndarray, shape (n_maturities,)
+            Maturities for prediction
+        return_std : bool, default=False
+            If True, return posterior standard deviation
+            
+        Returns
+        -------
+        vol_surface : ndarray, shape (n_maturities, n_strikes)
+            Predicted implied volatilities
+        std_surface : ndarray, shape (n_maturities, n_strikes), optional
+            Posterior standard deviation (uncertainty)
+        """
+        if not self.is_fitted:
+            raise ValueError("Must fit GP first")
+        
+        X_pred = []
+        for T in maturities:
+            for K in strikes_norm:
+                X_pred.append([T, K])
+        X_pred = np.array(X_pred)
+        
+        if return_std:
+            y_pred, y_std = self.gp.predict(X_pred, return_std=True)
+            
+            vol_surface = y_pred.reshape(len(maturities), len(strikes_norm))
+            std_surface = y_std.reshape(len(maturities), len(strikes_norm))
+            
+            return vol_surface, std_surface
+        else:
+            y_pred = self.gp.predict(X_pred)
+            vol_surface = y_pred.reshape(len(maturities), len(strikes_norm))
+            return vol_surface
+    
+    def check_arbitrage_violations(self, strikes_norm, maturities, S0=100):
+        """
+        Check for potential arbitrage violations in the interpolated surface.
+        
+        This is a simplified heuristic check that looks for:
+        1. Butterfly arbitrage: excessive concavity in strike direction
+        2. Calendar arbitrage: decreasing call prices with maturity
+        
+        Note: These are approximate checks and may not capture all arbitrage opportunities.
+        
+        Parameters
+        ----------
+        strikes_norm : ndarray
+            Normalized strikes
+        maturities : ndarray
+            Maturities in years
+        S0 : float, default=100
+            Spot price
+            
+        Returns
+        -------
+        violations : dict
+            Dictionary containing counts of detected violations by type
+        """
+        vol_surface = self.predict(strikes_norm, maturities)
+        
+        violations = {
+            'butterfly': 0,
+            'calendar': 0,
+            'total': 0
+        }
+        
+        # Butterfly spread: check convexity in strike direction
+        # Requires C''(K) > 0, approximately checking d²σ/dK² is not too negative
+        for i, T in enumerate(maturities):
+            vols = vol_surface[i, :]
+            if len(vols) >= 3:
+                d2_vol = np.diff(vols, n=2)
+                violations['butterfly'] += np.sum(d2_vol < -0.05)
+        
+        # Calendar spread: check monotonicity in maturity
+        # Call prices should increase with maturity (simplified check on vols)
+        for j in range(len(strikes_norm)):
+            vols_T = vol_surface[:, j]
+            d_vol = np.diff(vols_T)
+            violations['calendar'] += np.sum(d_vol < -0.05)
+        
+        violations['total'] = violations['butterfly'] + violations['calendar']
+        
+        return violations

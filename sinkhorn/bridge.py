@@ -1,7 +1,9 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from tqdm import tqdm
+
 
 class SinkhornBridge:
     """
@@ -111,7 +113,7 @@ class SinkhornBridge:
         u = torch.ones_like(a)
         v = torch.ones_like(b)
         
-        for iteration in tqdm(range(max_iter), desc="Sinkhorn"):
+        for iteration in range(max_iter):
             u_prev = u.clone()
             
             u = a / (K @ v + 1e-10)
@@ -119,7 +121,8 @@ class SinkhornBridge:
             
             error = torch.max(torch.abs(u - u_prev))
             if error < tol:
-                print(f"Converged at iteration {iteration}")
+                if iteration % 100 == 0 or iteration < 10:
+                    print(f"Sinkhorn converged at iteration {iteration}")
                 break
         
         # Convert scaling variables to potentials
@@ -188,6 +191,230 @@ class SinkhornBridge:
         Requires implementation of compute_drift method.
         """
         raise NotImplementedError("Sampling requires drift computation to be implemented")
+
+
+class DriftNetwork(nn.Module):
+    """
+    Neural network to approximate the drift coefficient of the bridge SDE.
+    
+    Parameters
+    ----------
+    dim : int
+        Dimension of the state space
+    hidden_dim : int, default=64
+        Hidden layer dimension
+    n_layers : int, default=3
+        Number of hidden layers
+    """
+    
+    def __init__(self, dim, hidden_dim=64, n_layers=3):
+        super().__init__()
+        
+        layers = []
+        
+        # Input layer
+        layers.append(nn.Linear(dim + 1, hidden_dim))  # +1 for time
+        layers.append(nn.ReLU())
+        
+        # Hidden layers
+        for _ in range(n_layers - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.ReLU())
+        
+        # Output layer
+        layers.append(nn.Linear(hidden_dim, dim))
+        
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, x, t):
+        """
+        Compute drift at position x and time t.
+        
+        Parameters
+        ----------
+        x : torch.Tensor, shape (batch_size, dim)
+            Positions
+        t : torch.Tensor, shape (batch_size, 1)
+            Times
+            
+        Returns
+        -------
+        drift : torch.Tensor, shape (batch_size, dim)
+            Drift coefficients
+        """
+        # Concatenate position and time
+        xt = torch.cat([x, t], dim=-1)
+        return self.network(xt)
+
+
+class SchrodingerBridge:
+    """
+    Schrödinger Bridge with Neural Network Drift Approximation.
+    
+    This class implements a trainable Schrödinger bridge that:
+    1. Uses Sinkhorn algorithm to compute optimal transport potentials
+    2. Learns drift via neural network
+    3. Enables sampling from the bridge distribution
+    
+    Parameters
+    ----------
+    dim : int
+        Dimension of the state space
+    hidden_dim : int, default=64
+        Hidden dimension for drift network
+    n_layers : int, default=3
+        Number of layers in drift network
+    device : str, default='cpu'
+        PyTorch device
+        
+    Attributes
+    ----------
+    drift_net : DriftNetwork
+        Neural network approximating drift
+    """
+    
+    def __init__(self, dim, hidden_dim=64, n_layers=3, device='cpu'):
+        self.dim = dim
+        self.device = device
+        
+        # Initialize drift network
+        self.drift_net = DriftNetwork(dim, hidden_dim, n_layers).to(device)
+        
+        # Sinkhorn bridge (will be initialized during training)
+        self.sinkhorn = None
+        
+    def train_bridge(self, 
+                    source_samples,
+                    target_samples,
+                    n_iterations=100,
+                    lr=1e-3,
+                    batch_size=256,
+                    epsilon=0.1):
+        """
+        Train the bridge to transport source to target distribution.
+        
+        Parameters
+        ----------
+        source_samples : array_like, shape (n_source, dim)
+            Samples from source distribution
+        target_samples : array_like, shape (n_target, dim)
+            Samples from target distribution
+        n_iterations : int, default=100
+            Number of training iterations
+        lr : float, default=1e-3
+            Learning rate
+        batch_size : int, default=256
+            Batch size for training
+        epsilon : float, default=0.1
+            Entropic regularization for Sinkhorn
+            
+        Returns
+        -------
+        losses : list
+            Training losses
+        """
+        # First, compute Sinkhorn potentials
+        print("Computing Sinkhorn potentials...")
+        self.sinkhorn = SinkhornBridge(
+            source_samples,
+            target_samples,
+            epsilon=epsilon,
+            device=self.device
+        )
+        
+        f, g = self.sinkhorn.sinkhorn_iterations(max_iter=500, tol=1e-6)
+        
+        # Convert to tensors
+        source = torch.tensor(source_samples, dtype=torch.float32).to(self.device)
+        target = torch.tensor(target_samples, dtype=torch.float32).to(self.device)
+        
+        # Train drift network
+        print("Training drift network...")
+        optimizer = optim.Adam(self.drift_net.parameters(), lr=lr)
+        
+        losses = []
+        
+        for iteration in range(n_iterations):
+            # Sample batch
+            idx_s = np.random.choice(len(source), min(batch_size, len(source)), replace=True)
+            idx_t = np.random.choice(len(target), min(batch_size, len(target)), replace=True)
+            
+            x_source = source[idx_s]
+            x_target = target[idx_t]
+            
+            # Sample random times
+            t = torch.rand(len(x_source), 1).to(self.device)
+            
+            # Linear interpolation between source and target
+            x_t = (1 - t) * x_source + t * x_target
+            
+            # Compute drift
+            drift = self.drift_net(x_t, t)
+            
+            # Loss: match expected displacement
+            expected_displacement = x_target - x_source
+            loss = torch.mean((drift - expected_displacement) ** 2)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            losses.append(loss.item())
+            
+            if (iteration + 1) % 20 == 0:
+                print(f"  Iteration {iteration+1}/{n_iterations}, Loss: {loss.item():.6f}")
+        
+        return losses
+    
+    def sample_bridge(self, source_samples, n_steps=50):
+        """
+        Sample from the trained bridge starting from source samples.
+        
+        Uses Euler-Maruyama discretization of the bridge SDE:
+            dX_t = b(X_t, t) dt + dW_t
+        
+        Parameters
+        ----------
+        source_samples : array_like, shape (n_samples, dim)
+            Starting positions (from source distribution)
+        n_steps : int, default=50
+            Number of discretization steps
+            
+        Returns
+        -------
+        trajectories : torch.Tensor, shape (n_samples, n_steps+1, dim)
+            Sampled trajectories
+        """
+        source = torch.tensor(source_samples, dtype=torch.float32).to(self.device)
+        n_samples = len(source)
+        
+        # Initialize trajectories
+        trajectories = torch.zeros(n_samples, n_steps + 1, self.dim).to(self.device)
+        trajectories[:, 0, :] = source
+        
+        dt = 1.0 / n_steps
+        
+        self.drift_net.eval()
+        with torch.no_grad():
+            for step in range(n_steps):
+                t_current = step * dt
+                t_tensor = torch.full((n_samples, 1), t_current).to(self.device)
+                
+                x_current = trajectories[:, step, :]
+                
+                # Compute drift
+                drift = self.drift_net(x_current, t_tensor)
+                
+                # Brownian increment
+                dW = torch.randn_like(x_current) * np.sqrt(dt)
+                
+                # Euler-Maruyama step
+                x_next = x_current + drift * dt + dW
+                
+                trajectories[:, step + 1, :] = x_next
+        
+        return trajectories
 
 
 if __name__ == "__main__":

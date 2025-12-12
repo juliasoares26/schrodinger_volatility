@@ -189,3 +189,196 @@ def relative_error_by_moneyness(vol_predicted, vol_true, strikes_norm):
     }
     
     return errors_by_region
+
+
+def moment_matching_error(estimated_moments, true_moments):
+    """
+    Compute errors in moment matching for distribution comparison.
+    
+    Parameters
+    ----------
+    estimated_moments : dict
+        Dictionary with keys: 'mean', 'std', 'skew', 'kurt'
+    true_moments : dict
+        Dictionary with same keys as estimated_moments
+        
+    Returns
+    -------
+    errors : dict
+        Dictionary with absolute errors for each moment
+    """
+    errors = {}
+    for key in ['mean', 'std', 'skew', 'kurt']:
+        if key in estimated_moments and key in true_moments:
+            errors[f'{key}_error'] = abs(estimated_moments[key] - true_moments[key])
+        else:
+            errors[f'{key}_error'] = np.nan
+    
+    return errors
+
+
+def distribution_distance(samples1, weights1, samples2, weights2, metric='wasserstein'):
+    """
+    Compute distance between two weighted empirical distributions.
+    
+    Parameters
+    ----------
+    samples1 : ndarray, shape (n1,)
+        First set of samples
+    weights1 : ndarray, shape (n1,)
+        Weights for first samples
+    samples2 : ndarray, shape (n2,)
+        Second set of samples
+    weights2 : ndarray, shape (n2,)
+        Weights for second samples
+    metric : str, default='wasserstein'
+        Distance metric: 'wasserstein', 'kl', 'total_variation'
+        
+    Returns
+    -------
+    distance : float
+        Distance between distributions
+    """
+    if metric == 'wasserstein':
+        # Wasserstein-1 distance (Earth Mover's Distance)
+        return wasserstein_distance(samples1, samples2, weights1, weights2)
+    
+    elif metric == 'kl':
+        # KL divergence (requires discretization)
+        return kl_divergence(samples1, weights1, samples2, weights2)
+    
+    elif metric == 'total_variation':
+        # Total variation distance
+        return total_variation_distance(samples1, weights1, samples2, weights2)
+    
+    else:
+        raise ValueError(f"Unknown metric: {metric}")
+
+
+def wasserstein_distance(samples1, samples2, weights1=None, weights2=None):
+    """
+    Compute Wasserstein-1 (Earth Mover's) distance.
+    
+    Parameters
+    ----------
+    samples1, samples2 : ndarray
+        Sample arrays
+    weights1, weights2 : ndarray, optional
+        Sample weights (default: uniform)
+        
+    Returns
+    -------
+    distance : float
+        Wasserstein distance
+    """
+    if weights1 is None:
+        weights1 = np.ones(len(samples1)) / len(samples1)
+    if weights2 is None:
+        weights2 = np.ones(len(samples2)) / len(samples2)
+    
+    # Sort samples
+    idx1 = np.argsort(samples1)
+    idx2 = np.argsort(samples2)
+    
+    sorted_samples1 = samples1[idx1]
+    sorted_samples2 = samples2[idx2]
+    sorted_weights1 = weights1[idx1]
+    sorted_weights2 = weights2[idx2]
+    
+    # Compute cumulative distributions
+    cum_weights1 = np.cumsum(sorted_weights1)
+    cum_weights2 = np.cumsum(sorted_weights2)
+    
+    # Compute Wasserstein distance
+    all_samples = np.sort(np.concatenate([sorted_samples1, sorted_samples2]))
+    distance = 0.0
+    
+    for i in range(len(all_samples) - 1):
+        x1, x2 = all_samples[i], all_samples[i + 1]
+        
+        # Find cumulative weights at this point
+        F1 = np.searchsorted(sorted_samples1, (x1 + x2) / 2, side='right')
+        F2 = np.searchsorted(sorted_samples2, (x1 + x2) / 2, side='right')
+        
+        w1 = cum_weights1[F1 - 1] if F1 > 0 else 0
+        w2 = cum_weights2[F2 - 1] if F2 > 0 else 0
+        
+        distance += abs(w1 - w2) * (x2 - x1)
+    
+    return distance
+
+
+def kl_divergence(samples1, weights1, samples2, weights2, n_bins=50):
+    """
+    Compute KL divergence between two distributions using histograms.
+    
+    Parameters
+    ----------
+    samples1, samples2 : ndarray
+        Sample arrays
+    weights1, weights2 : ndarray
+        Sample weights
+    n_bins : int
+        Number of bins for discretization
+        
+    Returns
+    -------
+    kl : float
+        KL divergence (in nats)
+    """
+    # Create common bins
+    all_samples = np.concatenate([samples1, samples2])
+    bins = np.linspace(all_samples.min(), all_samples.max(), n_bins + 1)
+    
+    # Compute histograms
+    hist1, _ = np.histogram(samples1, bins=bins, weights=weights1, density=True)
+    hist2, _ = np.histogram(samples2, bins=bins, weights=weights2, density=True)
+    
+    # Normalize
+    hist1 = hist1 / (hist1.sum() + 1e-10)
+    hist2 = hist2 / (hist2.sum() + 1e-10)
+    
+    # Add small epsilon to avoid log(0)
+    hist1 = hist1 + 1e-10
+    hist2 = hist2 + 1e-10
+    
+    # Compute KL divergence
+    kl = np.sum(hist1 * np.log(hist1 / hist2))
+    
+    return kl
+
+
+def total_variation_distance(samples1, weights1, samples2, weights2, n_bins=50):
+    """
+    Compute total variation distance between distributions.
+    
+    Parameters
+    ----------
+    samples1, samples2 : ndarray
+        Sample arrays
+    weights1, weights2 : ndarray
+        Sample weights
+    n_bins : int
+        Number of bins for discretization
+        
+    Returns
+    -------
+    tv : float
+        Total variation distance
+    """
+    # Create common bins
+    all_samples = np.concatenate([samples1, samples2])
+    bins = np.linspace(all_samples.min(), all_samples.max(), n_bins + 1)
+    
+    # Compute histograms
+    hist1, _ = np.histogram(samples1, bins=bins, weights=weights1, density=True)
+    hist2, _ = np.histogram(samples2, bins=bins, weights=weights2, density=True)
+    
+    # Normalize
+    hist1 = hist1 / (hist1.sum() + 1e-10)
+    hist2 = hist2 / (hist2.sum() + 1e-10)
+    
+    # Total variation distance
+    tv = 0.5 * np.sum(np.abs(hist1 - hist2))
+    
+    return tv
