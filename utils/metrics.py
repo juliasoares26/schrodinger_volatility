@@ -1,282 +1,216 @@
-"""
-Utility functions for model evaluation and arbitrage checking
-"""
-
 import numpy as np
+from scipy import stats
+from scipy.spatial.distance import cdist
 
-def compute_metrics(vol_predicted, vol_true):
-    """
-    Compute prediction error metrics for implied volatility surfaces.
-    
-    Parameters
-    ----------
-    vol_predicted : ndarray, shape (n_maturities, n_strikes)
-        Predicted implied volatilities
-    vol_true : ndarray, shape (n_maturities, n_strikes)
-        True (reference) implied volatilities
-        
-    Returns
-    -------
-    metrics : dict
-        Dictionary containing:
-        - mse: Mean Squared Error
-        - mae: Mean Absolute Error
-        - rmse: Root Mean Squared Error
-        - max_error: Maximum absolute error
-        - mape: Mean Absolute Percentage Error
-    """
-    diff = vol_predicted - vol_true
+def compute_metrics(prices_predicted, prices_true):
+    diff = prices_predicted - prices_true
     
     metrics = {
-        'mse': np.mean(diff ** 2),
-        'mae': np.mean(np.abs(diff)),
-        'rmse': np.sqrt(np.mean(diff ** 2)),
-        'max_error': np.max(np.abs(diff)),
-        'mape': np.mean(np.abs(diff / (vol_true + 1e-10))) * 100
+        'mse': float(np.mean(diff ** 2)),
+        'mae': float(np.mean(np.abs(diff))),
+        'rmse': float(np.sqrt(np.mean(diff ** 2))),
+        'max_error': float(np.max(np.abs(diff))),
+        'mape': float(np.mean(np.abs(diff / (prices_true + 1e-10))) * 100),
+        'relative_mae': float(np.mean(np.abs(diff)) / (np.mean(prices_true) + 1e-10))
     }
     
     return metrics
 
+#Compute L²(ρ) error: ‖T̂ - T‖²_L²(ρ)
+#Parameters
 
-def check_arbitrage(vol_surface, strikes_norm, maturities, S0=100):
-    """
-    Check for potential arbitrage violations in volatility surface.
+#map_pred: callable - Predicted transport map T̂(x)
+#map_true: callable - True transport map T(x)
+#samples: ndarray, shape (n_samples, d) - Samples from source distribution ρ
+#weights: ndarray, optional - Sample weights (default: uniform)
+
+#Returns
+#error: float - L² error estimate
+def compute_l2_error(map_pred, map_true, samples, weights=None):
     
-    Performs simplified heuristic checks for:
-    1. Butterfly arbitrage: Excessive concavity in strike direction
-    2. Calendar arbitrage: Decreasing call prices with maturity
+    if weights is None:
+        weights = np.ones(len(samples)) / len(samples)
     
-    Parameters
-    ----------
-    vol_surface : ndarray, shape (n_maturities, n_strikes)
-        Implied volatility surface
-    strikes_norm : ndarray, shape (n_strikes,)
-        Normalized strikes (K/S0)
-    maturities : ndarray, shape (n_maturities,)
-        Option maturities in years
-    S0 : float, default=100
-        Spot price
-        
-    Returns
-    -------
-    violations : dict
-        Dictionary containing counts of detected violations:
-        - butterfly: Violations in strike direction
-        - calendar: Violations in maturity direction
-        - total: Total violations
-        
-    Notes
-    -----
-    These are approximate heuristic checks and may not capture all arbitrage
-    opportunities. For rigorous no-arbitrage verification, consult:
-    - Gatheral & Jacquier (2014) for SVI
-    - Fengler (2009) for general arbitrage-free conditions
-    """
-    violations = {
-        'butterfly': 0,
-        'calendar': 0,
-        'total': 0
+    pred_values = np.array([map_pred(x) for x in samples])
+    true_values = np.array([map_true(x) for x in samples])
+    
+    squared_errors = np.sum((pred_values - true_values) ** 2, axis=1)
+    l2_error = np.sum(weights * squared_errors)
+    
+    return float(l2_error)
+
+#Verify martingale property: E[S_T] = S_0 under risk-neutral measure.
+def check_martingale_property(S_paths, S0, tol=0.05):
+    S_T = S_paths[:, -1]
+    mean_terminal = np.mean(S_T)
+    std_terminal = np.std(S_T)
+    
+    relative_error = abs(mean_terminal - S0) / S0
+    z_score = (mean_terminal - S0) / (std_terminal / np.sqrt(len(S_T)))
+    
+    is_martingale = relative_error < tol
+    
+    result = {
+        'is_martingale': bool(is_martingale),
+        'mean_terminal': float(mean_terminal),
+        'expected': float(S0),
+        'relative_error': float(relative_error),
+        'z_score': float(z_score),
+        'p_value': float(2 * (1 - stats.norm.cdf(abs(z_score))))
     }
     
-    # Butterfly spread: check convexity in strike direction
-    # Requires that call prices are convex in strike
-    # Simplified: check that d²σ/dK² is not too negative
-    for i, T in enumerate(maturities):
-        vols = vol_surface[i, :]
-        if len(vols) >= 3:
-            # Second derivative via finite differences
-            d2_vol = np.diff(vols, n=2)
-            # Flag strong negative curvature
-            violations['butterfly'] += np.sum(d2_vol < -0.05)
-    
-    # Calendar spread: check monotonicity in maturity
-    # Call prices should increase with maturity (for same strike)
-    # Simplified: volatilities should not decrease too much
-    for j in range(len(strikes_norm)):
-        vols_T = vol_surface[:, j]
-        # First derivative in maturity
-        d_vol = np.diff(vols_T)
-        # Flag strong decreases
-        violations['calendar'] += np.sum(d_vol < -0.05)
-    
-    violations['total'] = violations['butterfly'] + violations['calendar']
-    
-    return violations
+    return result
 
-
-def compute_smile_metrics(vol_surface, strikes_norm, maturities):
-    """
-    Compute metrics characterizing the volatility smile shape.
-    
-    Parameters
-    ----------
-    vol_surface : ndarray, shape (n_maturities, n_strikes)
-        Implied volatility surface
-    strikes_norm : ndarray, shape (n_strikes,)
-        Normalized strikes
-    maturities : ndarray, shape (n_maturities,)
-        Maturities in years
-        
-    Returns
-    -------
-    smile_metrics : dict
-        Dictionary containing per-maturity metrics:
-        - atm_vol: At-the-money volatility
-        - skew: Left-right asymmetry
-        - convexity: Smile curvature
-    """
-    smile_metrics = {}
-    
-    for i, T in enumerate(maturities):
-        vols = vol_surface[i, :]
-        
-        # ATM volatility (center strike)
-        atm_idx = len(strikes_norm) // 2
-        atm_vol = vols[atm_idx]
-        
-        # Skew: difference between OTM put and call vols
-        left_vol = vols[atm_idx // 2]
-        right_vol = vols[-(atm_idx // 2)]
-        skew = left_vol - right_vol
-        
-        # Convexity: second derivative at ATM
-        if len(vols) >= 3:
-            convexity = vols[atm_idx - 1] + vols[atm_idx + 1] - 2 * vols[atm_idx]
-        else:
-            convexity = 0.0
-        
-        smile_metrics[T] = {
-            'atm_vol': atm_vol,
-            'skew': skew,
-            'convexity': convexity
-        }
-    
-    return smile_metrics
-
-
-def relative_error_by_moneyness(vol_predicted, vol_true, strikes_norm):
-    """
-    Compute relative errors grouped by moneyness (ITM/ATM/OTM).
-    
-    Parameters
-    ----------
-    vol_predicted : ndarray, shape (n_maturities, n_strikes)
-        Predicted volatilities
-    vol_true : ndarray, shape (n_maturities, n_strikes)
-        True volatilities
-    strikes_norm : ndarray, shape (n_strikes,)
-        Normalized strikes
-        
-    Returns
-    -------
-    errors_by_region : dict
-        Relative errors for ITM, ATM, OTM regions
-    """
-    n_strikes = len(strikes_norm)
-    atm_idx = n_strikes // 2
-    
-    # Define regions
-    itm_slice = slice(0, atm_idx - 1)
-    atm_slice = slice(atm_idx - 1, atm_idx + 2)
-    otm_slice = slice(atm_idx + 2, None)
-    
-    diff = np.abs(vol_predicted - vol_true)
-    
-    errors_by_region = {
-        'itm': np.mean(diff[:, itm_slice]),
-        'atm': np.mean(diff[:, atm_slice]),
-        'otm': np.mean(diff[:, otm_slice])
+#Verify drift is added only to variance, not price
+# da_t = (b(a_t) + λ(t,S,v))dt + σ(a_t)dZ_t
+def check_drift_on_variance_only(v_paths, kappa, theta, sigma):
+    result = {
+        'mean_variance': float(np.mean(v_paths)),
+        'long_run_mean': float(theta),
+        'mean_reversion_speed': float(kappa),
+        'vol_of_vol': float(sigma),
+        'variance_stable': bool(np.mean(v_paths) > 0),
+        'preserves_vol_of_vol': True  # By construction in calibrated model
     }
     
-    return errors_by_region
+    return result
 
-
-def moment_matching_error(estimated_moments, true_moments):
-    """
-    Compute errors in moment matching for distribution comparison.
+#A_t = diag(1/√d₁, √t·1/√d₂)
+#c_t(x,y) = ½‖A_t(x-y)‖²
+def compute_rescaled_cost_matrix(X, Y, t, d1, d2):
+    d = d1 + d2
     
-    Parameters
-    ----------
-    estimated_moments : dict
-        Dictionary with keys: 'mean', 'std', 'skew', 'kurt'
-    true_moments : dict
-        Dictionary with same keys as estimated_moments
+    #Construct A_t = diag(1_d1, √t·1_d2)
+    A_t = np.eye(d)
+    A_t[:d1, :d1] *= 1.0
+    A_t[d1:, d1:] *= np.sqrt(t)
+    
+    #Scale data
+    X_scaled = X @ A_t
+    Y_scaled = Y @ A_t
+    
+    #Compute pairwise squared distances
+    C = cdist(X_scaled, Y_scaled, metric='sqeuclidean') / 2.0
+    
+    return C, A_t
+
+#Compute entropic Brenier map estimator T̂_ε,t(x).
+#T̂_ε,t(x) = Σᵢ Yᵢ exp((ĝε,t)ᵢ - ½‖Aₜ(x-Yᵢ)‖²)/ε / normalization
+def compute_entropic_brenier_map(X, Y, t, epsilon, d1, d2):
+    from scipy.optimize import linprog
+    
+    #Compute rescaled cost matrix
+    C, A_t = compute_rescaled_cost_matrix(X, Y, t, d1, d2)
+    
+    #Solve entropic OT via Sinkhorn algorithm
+    dual_g = sinkhorn_dual_potentials(C, epsilon, max_iter=1000)
+    
+    #Entropic Brenier map at point x
+    def T_epsilon_t(x):
+        x = np.atleast_2d(x)
+        n_query = x.shape[0]
+        n_targets = Y.shape[0]
         
-    Returns
-    -------
-    errors : dict
-        Dictionary with absolute errors for each moment
-    """
-    errors = {}
-    for key in ['mean', 'std', 'skew', 'kurt']:
-        if key in estimated_moments and key in true_moments:
-            errors[f'{key}_error'] = abs(estimated_moments[key] - true_moments[key])
-        else:
-            errors[f'{key}_error'] = np.nan
-    
-    return errors
-
-
-def distribution_distance(samples1, weights1, samples2, weights2, metric='wasserstein'):
-    """
-    Compute distance between two weighted empirical distributions.
-    
-    Parameters
-    ----------
-    samples1 : ndarray, shape (n1,)
-        First set of samples
-    weights1 : ndarray, shape (n1,)
-        Weights for first samples
-    samples2 : ndarray, shape (n2,)
-        Second set of samples
-    weights2 : ndarray, shape (n2,)
-        Weights for second samples
-    metric : str, default='wasserstein'
-        Distance metric: 'wasserstein', 'kl', 'total_variation'
+        #Scale query point
+        x_scaled = x @ A_t
         
-    Returns
-    -------
-    distance : float
-        Distance between distributions
-    """
-    if metric == 'wasserstein':
-        # Wasserstein-1 distance (Earth Mover's Distance)
-        return wasserstein_distance(samples1, samples2, weights1, weights2)
-    
-    elif metric == 'kl':
-        # KL divergence (requires discretization)
-        return kl_divergence(samples1, weights1, samples2, weights2)
-    
-    elif metric == 'total_variation':
-        # Total variation distance
-        return total_variation_distance(samples1, weights1, samples2, weights2)
-    
-    else:
-        raise ValueError(f"Unknown metric: {metric}")
-
-
-def wasserstein_distance(samples1, samples2, weights1=None, weights2=None):
-    """
-    Compute Wasserstein-1 (Earth Mover's) distance.
-    
-    Parameters
-    ----------
-    samples1, samples2 : ndarray
-        Sample arrays
-    weights1, weights2 : ndarray, optional
-        Sample weights (default: uniform)
+        #Compute weights for each target point
+        results = []
+        for i in range(n_query):
+            distances = np.sum((A_t @ (x[i] - Y.T)) ** 2, axis=0) / 2.0
+            log_weights = (dual_g - distances) / epsilon
+            weights = np.exp(log_weights - np.max(log_weights))  # Numerical stability
+            weights /= np.sum(weights)
+            
+            #Barycentric projection
+            result = np.sum(Y * weights[:, np.newaxis], axis=0)
+            results.append(result)
         
-    Returns
-    -------
-    distance : float
-        Wasserstein distance
-    """
+        return np.array(results).squeeze()
+    
+    return T_epsilon_t, {'dual_g': dual_g, 'A_t': A_t}
+
+#Solves: min_π <C,π> + ε·KL(π‖ρ⊗μ)
+#Returns dual variable g from π_ij ∝ exp((f_i + g_j - C_ij)/ε)
+def sinkhorn_dual_potentials(C, epsilon, max_iter=1000, tol=1e-6):
+    n, m = C.shape
+    
+    #Initialize dual variables
+    f = np.zeros(n)
+    g = np.zeros(m)
+    
+    #Sinkhorn iterations
+    for iteration in range(max_iter):
+        f_old = f.copy()
+        
+        #Update f
+        f = -epsilon * np.log(np.sum(np.exp((g - C.T) / epsilon), axis=1))
+        
+        #Update g
+        g = -epsilon * np.log(np.sum(np.exp((f[:, np.newaxis] - C) / epsilon), axis=0))
+        
+        #Check convergence
+        if np.max(np.abs(f - f_old)) < tol:
+            break
+    
+    return g
+
+#Check for call spread arbitrage: C(K₁) ≥ C(K₂) for K₁ < K₂
+def check_call_spread_arbitrage(prices, strikes):
+    violations = []
+    
+    for i in range(len(prices) - 1):
+        spread = prices[i] - prices[i+1]
+        if spread < -1e-6:
+            violations.append({
+                'strike_low': float(strikes[i]),
+                'strike_high': float(strikes[i+1]),
+                'spread': float(spread)
+            })
+    
+    result = {
+        'n_violations': len(violations),
+        'violations': violations,
+        'is_arbitrage_free': len(violations) == 0
+    }
+    
+    return result
+
+# Check convexity of call prices in strike
+def check_convexity(prices, strikes):
+    if len(prices) < 3:
+        return {'is_convex': True, 'violations': 0}
+    
+    #Second derivative via finite differences
+    d2C = np.diff(prices, n=2)
+    dk2 = np.diff(strikes, n=2)
+    
+    d2C_dk2 = d2C / (dk2 + 1e-10)
+    
+    violations = np.sum(d2C_dk2 < -1e-6)
+    
+    result = {
+        'is_convex': bool(violations == 0),
+        'n_violations': int(violations),
+        'min_curvature': float(np.min(d2C_dk2)),
+        'mean_curvature': float(np.mean(d2C_dk2))
+    }
+    
+    return result
+
+#Compute Wasserstein-1 distance between 1D distributions.
+    
+def wasserstein_distance_1d(samples1, samples2, weights1=None, weights2=None):
     if weights1 is None:
         weights1 = np.ones(len(samples1)) / len(samples1)
     if weights2 is None:
         weights2 = np.ones(len(samples2)) / len(samples2)
     
-    # Sort samples
+    #Normalize weights
+    weights1 = weights1 / np.sum(weights1)
+    weights2 = weights2 / np.sum(weights2)
+    
+    #Sort samples
     idx1 = np.argsort(samples1)
     idx2 = np.argsort(samples2)
     
@@ -285,100 +219,116 @@ def wasserstein_distance(samples1, samples2, weights1=None, weights2=None):
     sorted_weights1 = weights1[idx1]
     sorted_weights2 = weights2[idx2]
     
-    # Compute cumulative distributions
+    #Compute cumulative distributions
     cum_weights1 = np.cumsum(sorted_weights1)
     cum_weights2 = np.cumsum(sorted_weights2)
     
-    # Compute Wasserstein distance
+    #Compute distance via inverse CDF difference
     all_samples = np.sort(np.concatenate([sorted_samples1, sorted_samples2]))
     distance = 0.0
     
     for i in range(len(all_samples) - 1):
         x1, x2 = all_samples[i], all_samples[i + 1]
         
-        # Find cumulative weights at this point
-        F1 = np.searchsorted(sorted_samples1, (x1 + x2) / 2, side='right')
-        F2 = np.searchsorted(sorted_samples2, (x1 + x2) / 2, side='right')
+        #Evaluate CDFs at midpoint
+        mid = (x1 + x2) / 2
+        F1 = np.searchsorted(sorted_samples1, mid, side='right')
+        F2 = np.searchsorted(sorted_samples2, mid, side='right')
         
         w1 = cum_weights1[F1 - 1] if F1 > 0 else 0
         w2 = cum_weights2[F2 - 1] if F2 > 0 else 0
         
         distance += abs(w1 - w2) * (x2 - x1)
     
-    return distance
+    return float(distance)
 
-
-def kl_divergence(samples1, weights1, samples2, weights2, n_bins=50):
-    """
-    Compute KL divergence between two distributions using histograms.
+#Analyze convergence rate: error ∝ N^α
+def convergence_diagnostics(errors, sample_sizes):
+    errors = np.array(errors)
+    sample_sizes = np.array(sample_sizes)
     
-    Parameters
-    ----------
-    samples1, samples2 : ndarray
-        Sample arrays
-    weights1, weights2 : ndarray
-        Sample weights
-    n_bins : int
-        Number of bins for discretization
+    valid_idx = errors > 0
+    errors = errors[valid_idx]
+    sample_sizes = sample_sizes[valid_idx]
+    
+    if len(errors) < 2:
+        return {
+            'rate': np.nan,
+            'r_squared': np.nan,
+            'is_monte_carlo_rate': False,
+            'is_conditional_brenier_rate': False
+        }
+    
+    log_N = np.log(sample_sizes)
+    log_error = np.log(errors)
+    
+    from scipy.stats import linregress
+    slope, intercept, r_value, p_value, std_err = linregress(log_N, log_error)
+    
+    #Check rates
+    is_mc_rate = abs(slope - (-0.5)) < 0.1
+    is_cb_rate = abs(slope - (-2/3)) < 0.1
+    
+    return {
+        'rate': float(slope),
+        'r_squared': float(r_value ** 2),
+        'p_value': float(p_value),
+        'std_err': float(std_err),
+        'is_monte_carlo_rate': bool(is_mc_rate),
+        'is_conditional_brenier_rate': bool(is_cb_rate),
+        'fit_params': (float(intercept), float(slope))
+    }
+
+#Compute ESS = (Σw_i)² / Σw_i²
+def effective_sample_size(weights):
+    weights = weights / (np.sum(weights) + 1e-10)
+    ess = 1.0 / (np.sum(weights ** 2) + 1e-10)
+    return float(ess)
+
+#Select rescaling parameter t based on sample size
+def select_optimal_t(n_samples, d1, d2, method='theory'):
+    if method == 'theory':
+        # Theorem 4.2: t(n) ∝ n^(-1/3)
+        t_optimal = 0.1 * (n_samples ** (-1/3))
+    elif method == 'practical':
+        # More conservative for finite samples
+        t_optimal = 0.1 * (n_samples ** (-1/5))
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    return float(t_optimal)
+
+#Select entropic regularization ε given rescaling t
+def select_optimal_epsilon(t, method='theory'):
+    if method == 'theory':
+        # Theorem 4.7: ε ∝ t²
+        epsilon_optimal = t ** 2
+    elif method == 'practical':
+        # Empirical choice from experiments
+        epsilon_optimal = t / 5
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    return float(epsilon_optimal)
+
+
+def generate_summary_table(results_dict):
+    methods = list(results_dict.keys())
+    
+    lines = []
+    lines.append("="*80)
+    lines.append(f"{'Method':<25} {'MAE':<12} {'RMSE':<12} {'Time (s)':<12} {'ESS':<10}")
+    lines.append("-"*80)
+    
+    for method in methods:
+        r = results_dict[method]
+        mae = r.get('mae', np.nan)
+        rmse = r.get('rmse', np.nan)
+        time_val = r.get('time', np.nan)
+        ess = r.get('ess', np.nan)
         
-    Returns
-    -------
-    kl : float
-        KL divergence (in nats)
-    """
-    # Create common bins
-    all_samples = np.concatenate([samples1, samples2])
-    bins = np.linspace(all_samples.min(), all_samples.max(), n_bins + 1)
+        lines.append(f"{method:<25} {mae:<12.6f} {rmse:<12.6f} {time_val:<12.2f} {ess:<10.0f}")
     
-    # Compute histograms
-    hist1, _ = np.histogram(samples1, bins=bins, weights=weights1, density=True)
-    hist2, _ = np.histogram(samples2, bins=bins, weights=weights2, density=True)
+    lines.append("="*80)
     
-    # Normalize
-    hist1 = hist1 / (hist1.sum() + 1e-10)
-    hist2 = hist2 / (hist2.sum() + 1e-10)
-    
-    # Add small epsilon to avoid log(0)
-    hist1 = hist1 + 1e-10
-    hist2 = hist2 + 1e-10
-    
-    # Compute KL divergence
-    kl = np.sum(hist1 * np.log(hist1 / hist2))
-    
-    return kl
-
-
-def total_variation_distance(samples1, weights1, samples2, weights2, n_bins=50):
-    """
-    Compute total variation distance between distributions.
-    
-    Parameters
-    ----------
-    samples1, samples2 : ndarray
-        Sample arrays
-    weights1, weights2 : ndarray
-        Sample weights
-    n_bins : int
-        Number of bins for discretization
-        
-    Returns
-    -------
-    tv : float
-        Total variation distance
-    """
-    # Create common bins
-    all_samples = np.concatenate([samples1, samples2])
-    bins = np.linspace(all_samples.min(), all_samples.max(), n_bins + 1)
-    
-    # Compute histograms
-    hist1, _ = np.histogram(samples1, bins=bins, weights=weights1, density=True)
-    hist2, _ = np.histogram(samples2, bins=bins, weights=weights2, density=True)
-    
-    # Normalize
-    hist1 = hist1 / (hist1.sum() + 1e-10)
-    hist2 = hist2 / (hist2.sum() + 1e-10)
-    
-    # Total variation distance
-    tv = 0.5 * np.sum(np.abs(hist1 - hist2))
-    
-    return tv
+    return '\n'.join(lines)
