@@ -4,11 +4,25 @@ from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 import time
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
 import sys
 
-# Import HestonModel
+# HestonUnified lives in calibration/base.py
+sys.path.insert(0, str(Path(__file__).parent))
+from base import HestonUnified
+
+# models/ for any other imports
 sys.path.append(str(Path(__file__).parent.parent / 'models'))
-from heston import HestonUnified
+
+_N_CPUS = cpu_count()
+
+# Module-level RBF constants — inherited by workers without pickling overhead
+_S_CENTERS_NORM  = np.array([0.8, 0.9, 1.0, 1.1, 1.2])
+_V_CENTERS = np.array([0.02, 0.04, 0.06])
+_RBF_CENTERS_UNIT = np.array(
+    [[Sc, vc] for Sc in _S_CENTERS_NORM for vc in _V_CENTERS]
+)  # (15, 2) — S column scaled by S0 at call time
+_RBF_SCALES = np.array([20.0, 0.02])
 
 def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3):
     script_dir = Path(__file__).parent.absolute()
@@ -28,7 +42,7 @@ def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3
             print(f"Found: {path}")
             return path
     
-    #Recursive search
+    # Recursive search
     for path in [script_dir, Path.cwd()]:
         for depth in range(search_depth + 1):
             pattern = '/'.join(['*'] * depth) + f'/{filename}'
@@ -41,12 +55,11 @@ def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3
     return None
 
 class ConditionalBrenierEstimator:
-
-#Parameters: 
-# d1: int - Dimension of conditioning variables
-# d2: int - Dimension of target variables
-#t : float - Rescaling parameter (t ∝ n^(-1/3))
-#epsilon: float - Entropic regularization (theory: ε ∝ t²)
+    #Parameters:
+    # d1: int - Dimension of conditioning variables
+    # d2: int - Dimension of target variables
+    # t : float - Rescaling parameter (t ∝ n^(-1/3))
+    # epsilon: float - Entropic regularization (theory: ε ∝ t²)
 
     def __init__(self, d1: int, d2: int, t: float = 0.01, epsilon: float = 0.001):
         self.d1 = d1
@@ -54,147 +67,173 @@ class ConditionalBrenierEstimator:
         self.t = t
         self.epsilon = epsilon
         
-        #Rescaling matrix A_t
+        # Rescaling matrix A_t
         d = d1 + d2
         self.A_t = np.eye(d)
         self.A_t[:d1, :d1] *= 1.0
         self.A_t[d1:, d1:] *= np.sqrt(t)
         
-        #Storage for training data
+        # Storage for training data
         self.X_train = None
         self.Y_train = None
         self.dual_potentials = None
+
+        # Cached arrays for fast predict (filled by fit())
+        self._Y_scaled = None
+        self._Y_target = None
     
-    #Compute rescaled cost matrix C_ij = ½‖A_t(X_i - Y_j)‖²
+    # Compute rescaled cost matrix C_ij = ½‖A_t(X_i - Y_j)‖²
     def compute_rescaled_cost(self, X, Y):
         X_scaled = X @ self.A_t
         Y_scaled = Y @ self.A_t
-        
         C = cdist(X_scaled, Y_scaled, metric='sqeuclidean') / 2.0
         return C
     
-    #Sinkhorn algorithm for entropic OT dual potentials
-    #Solves: min_π <C,π> + ε·KL(π‖ρ⊗μ)
-    #Returns: g ∈ ℝⁿ (dual potential on target)
+    # Sinkhorn algorithm for entropic OT dual potentials
+    # Solves: min_π <C,π> + ε·KL(π‖ρ⊗μ)
+    # Returns: g ∈ ℝⁿ (dual potential on target)
+    #
+    # Optimized: precompute K = exp(-C/ε) once, iterate via K-matvecs
 
     def sinkhorn_dual_potentials(self, C, max_iter=1000, tol=1e-6):
         n, m = C.shape
-        
+        K = np.exp(-C / self.epsilon)   # precomputed once
         f = np.zeros(n)
         g = np.zeros(m)
-        
         for iteration in range(max_iter):
             f_old = f.copy()
-            
-            # Update f
-            f = -self.epsilon * np.log(
-                np.sum(np.exp((g - C.T) / self.epsilon), axis=1) + 1e-10
-            )
-            
-            # Update g
-            g = -self.epsilon * np.log(
-                np.sum(np.exp((f[:, np.newaxis] - C) / self.epsilon), axis=0) + 1e-10
-            )
-            
-            # Check convergence
+            u = np.exp(g / self.epsilon)
+            f = -self.epsilon * np.log(K @ u + 1e-300)
+            v = np.exp(f / self.epsilon)
+            g = -self.epsilon * np.log(K.T @ v + 1e-300)
             if np.max(np.abs(f - f_old)) < tol:
                 break
-        
         return g
     
-    #Fit conditional Brenier map to joint samples
-    #X1 : ndarray, shape (n, d1) - Past features
-    #X2 : ndarray, shape (n, d2) - Future targets
+    # Fit conditional Brenier map to joint samples
+    # X1: ndarray, shape (n, d1) - Past features
+    # X2: ndarray, shape (n, d2) - Future targets
     
     def fit(self, X1, X2):
         print(f"\n Fitting Conditional Brenier Map")
         print(f"d1={self.d1}, d2={self.d2}, t={self.t:.4f}, ε={self.epsilon:.4f}")
-        
         n = X1.shape[0]
-        
-        #Store training data
         self.X_train = np.hstack([X1, X2])
         self.Y_train = np.hstack([X1, X2])
-        
-        #Compute rescaled cost
         C = self.compute_rescaled_cost(self.X_train, self.Y_train)
-        
-        #Solve Sinkhorn
         self.dual_potentials = self.sinkhorn_dual_potentials(C)
-        
+        #Cache for predict: avoid recomputing per call
+        self._Y_scaled = self.Y_train @ self.A_t.T   # (n, d)
+        self._Y_target = self.Y_train[:, self.d1:]   # (n, d2)
         print(f"Fitted on {n} samples")
 
-    #Predict X₂ given X₁ = x1_query
-    #T̂_ε,t(x) = Σᵢ Yᵢ · exp((gᵢ - ½‖A_t(x-Yᵢ)‖²)/ε) / normalization
-    #x1_query : ndarray, shape (d1,) - Conditioning variables - If True, returns (mean, samples)
-    #prediction : ndarray, shape (d2,) - Predicted target (conditional mean)
+    # Predict X₂ given X₁ = x1_query — fully batched over all queries
+    # T̂_ε,t(x) = Σᵢ Yᵢ · wᵢ(x)  where wᵢ ∝ exp((gᵢ - ½‖A_t(x-Yᵢ)‖²)/ε)
+
     def predict(self, x1_query, return_distribution=False):
         x1_query = np.atleast_2d(x1_query)
+        n_q = x1_query.shape[0]
         
         if self.dual_potentials is None:
             raise ValueError("Model not fitted, call fit() first")
         
-        #Extend query to full dimension (X₁ fixed, X₂ arbitrary)
-        x_extended = np.zeros((x1_query.shape[0], self.d1 + self.d2))
+        # Extend queries to full dimension (X₁ fixed, X₂ = 0 placeholder)
+        x_extended = np.zeros((n_q, self.d1 + self.d2))
         x_extended[:, :self.d1] = x1_query
         
-        predictions = []
+        # Scale all queries at once
+        XS = x_extended @ self.A_t.T                                          # (n_q, d)
+
+        # Batched squared distances: ½‖XS[i] - Y_scaled[j]‖²
+        sq_X    = np.sum(XS**2, axis=1, keepdims=True)                        # (n_q, 1)
+        sq_Y    = np.sum(self._Y_scaled**2, axis=1, keepdims=True).T          # (1, n_train)
+        dist_mat = (sq_X + sq_Y - 2.0 * (XS @ self._Y_scaled.T)) / 2.0       # (n_q, n_train)
+
+        # Numerically stable softmax
+        log_w  = (self.dual_potentials[None, :] - dist_mat) / self.epsilon    # (n_q, n_train)
+        log_w -= log_w.max(axis=1, keepdims=True)
+        w_mat  = np.exp(log_w)
+        w_mat /= w_mat.sum(axis=1, keepdims=True)
         
-        for x in x_extended:
-            #Compute distances in rescaled space
-            x_scaled = self.A_t @ x
-            Y_scaled = self.Y_train @ self.A_t.T
-            
-            distances = np.sum((Y_scaled - x_scaled) ** 2, axis=1) / 2.0
-            
-            #Compute barycentric weights
-            log_weights = (self.dual_potentials - distances) / self.epsilon
-            log_weights -= np.max(log_weights)  # Numerical stability
-            weights = np.exp(log_weights)
-            weights /= np.sum(weights)
-            
-            #Barycentric projection
-            result = np.sum(self.Y_train * weights[:, np.newaxis], axis=0)
-            predictions.append(result[self.d1:])  # Extract X₂ component
-        
-        prediction = np.array(predictions).squeeze()
+        # Barycentric projection
+        predictions = w_mat @ self._Y_target                                   # (n_q, d2)
+        prediction  = predictions.squeeze()
         
         if return_distribution:
-            #Sample from weighted distribution
+            #Sample from the query's weight distribution
+            weights_q = w_mat[-1]
             indices = np.random.choice(
-                len(self.Y_train), 
-                size=1000, 
-                p=weights,
-                replace=True
+                len(self.Y_train), size=1000, p=weights_q, replace=True
             )
-            samples = self.Y_train[indices, self.d1:]
+            samples = self._Y_target[indices]
             return prediction, samples
         
         return prediction
     
-    #Compute Wasserstein-2 distance between true and predicted conditionals.
+    # Compute Wasserstein-2 distance — single batched call, no Python loop
     def compute_wasserstein_error(self, x1_test, x2_test):
-        predictions = []
-        for x1 in x1_test:
-            pred = self.predict(x1)
-            predictions.append(pred)
-        
-        predictions = np.array(predictions)
-        
-        #W₂² ≈ MSE for Gaussians
+        predictions = self.predict(x1_test)
+        if predictions.ndim == 1:
+            predictions = predictions[np.newaxis, :]
         mse = np.mean((predictions - x2_test) ** 2)
         return np.sqrt(mse)
 
+# Top-level worker — required for multiprocessing pickle on Windows (spawn).
+# Prices a chunk of particles for one (strike, T) using antithetic variates and fully vectorized drift across all paths simultaneously.
+
+def _price_particle_chunk(args):
+    (weights_chunk, S0, v0, kappa, theta, sigma, rho,
+     strike, T, n_paths, n_steps) = args
+
+    dt          = T / n_steps
+    sqrt_dt     = np.sqrt(dt)
+    sqrt_1mrho2 = np.sqrt(1.0 - rho**2)
+    n_p         = len(weights_chunk)
+    total       = n_p * n_paths
+
+    # Antithetic variates: mirror noise to halve MC variance
+    half = total // 2
+    Z1 = np.random.randn(n_steps, half)
+    Z2 = np.random.randn(n_steps, half)
+    rW = np.concatenate([Z1, -Z1], axis=1)
+    rZ = np.concatenate([Z2, -Z2], axis=1)
+
+    S = np.full(total, S0, dtype=np.float64)
+    v = np.full(total, v0, dtype=np.float64)
+    pid = np.repeat(np.arange(n_p), n_paths)   # path → particle index
+
+    centers = _RBF_CENTERS_UNIT.copy()
+    centers[:, 0]  *= S0
+    sv_buf = np.empty((total, 2))
+
+    for i in range(n_steps):
+        dW = rW[i] * sqrt_dt
+        dZ = rho * rW[i] * sqrt_dt + sqrt_1mrho2 * rZ[i] * sqrt_dt
+        vc = np.maximum(v, 1e-8)
+
+        sv_buf[:, 0] = S
+        sv_buf[:, 1] = vc
+        diff = (sv_buf[:, None, :] - centers[None, :, :]) / _RBF_SCALES  # (total,15,2)
+        rbf = np.exp(-0.5 * np.sum(diff**2, axis=2))                     # (total,15)
+        drift = (rbf * weights_chunk[pid]).sum(axis=1)                     # (total,)
+
+        v = np.maximum(vc + (kappa*(theta - vc) + drift)*dt
+                          + sigma*np.sqrt(vc)*dZ, 1e-8)
+        S = S * np.exp(-0.5*vc*dt + np.sqrt(vc)*dW)
+
+    payoffs = np.maximum(S.reshape(n_p, n_paths) - strike, 0.0)
+    return payoffs.mean(axis=1)   # (n_p,)
+
+
 #Heston with Drift
 
-class HestonWithDrift:  
+class HestonWithDrift:
     def __init__(self, S0=100.0, v0=0.04, kappa=2.0, theta=0.04, 
                  sigma=0.3, rho=-0.7, r=0.0):
         self.heston = HestonUnified(
             S0=S0, v0=v0, kappa=kappa,
             theta=theta, sigma=sigma, rho=rho, r=r
         )
-        
         self.S0 = S0
         self.v0 = v0
         self.kappa = kappa
@@ -202,83 +241,77 @@ class HestonWithDrift:
         self.sigma = sigma
         self.rho = rho
         self.r = r
-        
         self.drift_weights = None
-    
-    #Drift function using RBF basis
-    def drift_lambda(self, t, S, v, weights):
+
+        #Pre-scaled RBF centers for this S0
+        self._centers = _RBF_CENTERS_UNIT.copy()
+        self._centers[:, 0]  *= S0
+
+    #Vectorized drift over a batch of paths — (n,) → (n,)
+    def drift_lambda_vectorized(self, S_arr, v_arr, weights):
         if weights is None or len(weights) == 0:
-            return 0.0
-        
-        S_centers = np.array([0.8, 0.9, 1.0, 1.1, 1.2]) * self.S0
-        v_centers = np.array([0.02, 0.04, 0.06])
-        
-        features = []
-        for S_c in S_centers:
-            for v_c in v_centers:
-                rbf = np.exp(-0.5 * (((S - S_c)/20)**2 + ((v - v_c)/0.02)**2))
-                features.append(rbf)
-        
-        return np.dot(weights, np.array(features))
-    
-    #Simulate paths with drift
+            return np.zeros(len(S_arr))
+        sv   = np.stack([S_arr, v_arr], axis=1)
+        diff = (sv[:, None, :] - self._centers[None, :, :]) / _RBF_SCALES
+        rbf  = np.exp(-0.5 * np.sum(diff**2, axis=2))
+        return rbf @ weights
+
+    #Simulate paths — pre-allocated noise, vectorized drift
     def simulate_paths(self, T, n_steps, n_paths=1, weights=None, 
-                      return_full_path=True, seed=None):
+                       return_full_path=True, seed=None):
         if weights is None:
             return self.heston.simulate_paths(T, n_steps, n_paths, seed=seed)
-        
         if seed is not None:
             np.random.seed(seed)
-        
         dt = T / n_steps
+        sqrt_dt = np.sqrt(dt)
+        sqrt_1mrho2 = np.sqrt(1.0 - self.rho**2)
         times = np.linspace(0, T, n_steps + 1)
-        
         S = np.ones((n_paths, n_steps + 1)) * self.S0
         v = np.ones((n_paths, n_steps + 1)) * self.v0
-        
+        Z1_all = np.random.randn(n_steps, n_paths)
+        Z2_all = np.random.randn(n_steps, n_paths)
         for i in range(n_steps):
-            t = times[i]
-            
-            dW = np.random.randn(n_paths) * np.sqrt(dt)
-            dZ_indep = np.random.randn(n_paths) * np.sqrt(dt)
-            dZ = self.rho * dW + np.sqrt(1 - self.rho**2) * dZ_indep
-            
-            v_current = np.maximum(v[:, i], 1e-8)
-            
-            lambda_drift = np.array([
-                self.drift_lambda(t, S[j, i], v_current[j], weights) 
-                for j in range(n_paths)
-            ])
-            
-            drift_v = self.kappa * (self.theta - v_current) + lambda_drift
-            dv = drift_v * dt + self.sigma * np.sqrt(v_current) * dZ
-            v[:, i + 1] = np.maximum(v_current + dv, 1e-8)
-            
-            dS = S[:, i] * np.sqrt(v_current) * dW
-            S[:, i + 1] = S[:, i] + dS
-        
+            dW = Z1_all[i] * sqrt_dt
+            dZ = self.rho * Z1_all[i] * sqrt_dt + sqrt_1mrho2 * Z2_all[i] * sqrt_dt
+            vc = np.maximum(v[:, i], 1e-8)
+            lam = self.drift_lambda_vectorized(S[:, i], vc, weights)
+            v[:, i+1] = np.maximum(
+                vc + (self.kappa*(self.theta - vc) + lam)*dt + self.sigma*np.sqrt(vc)*dZ,
+                1e-8)
+            S[:, i+1] = S[:, i] * np.exp(-0.5*vc*dt + np.sqrt(vc)*dW)
         if return_full_path:
             return S, v, times
-        else:
-            return S[:, -1], v[:, -1], None
-    
-    #Price calls with drift
+        return S[:, -1], v[:, -1], None
+
+    #Price calls — antithetic variates + all strikes broadcast
     def price_calls(self, strikes, T, n_paths=10000, weights=None):
-        S_T, _, _ = self.simulate_paths(
-            T, n_steps=100, n_paths=n_paths, 
-            weights=weights, return_full_path=False
-        )
-        
-        prices = []
-        for K in strikes:
-            payoff = np.maximum(S_T - K, 0)
-            prices.append(np.mean(payoff))
-        
-        return np.array(prices)
+        half = n_paths // 2
+        n_steps = 100
+        dt = T / n_steps
+        sqrt_dt = np.sqrt(dt)
+        sqrt_1mrho2 = np.sqrt(1.0 - self.rho**2)
+        Z1 = np.random.randn(n_steps, half)
+        Z2 = np.random.randn(n_steps, half)
+        Z1f = np.concatenate([Z1, -Z1], axis=1)
+        Z2f = np.concatenate([Z2, -Z2], axis=1)
+        S_arr = np.full(n_paths, self.S0)
+        v_arr = np.full(n_paths, self.v0)
+        for i in range(n_steps):
+            dW = Z1f[i] * sqrt_dt
+            dZ = self.rho * Z1f[i] * sqrt_dt + sqrt_1mrho2 * Z2f[i] * sqrt_dt
+            vc = np.maximum(v_arr, 1e-8)
+            lam = self.drift_lambda_vectorized(S_arr, vc, weights) if weights is not None else 0.0
+            v_arr = np.maximum(
+                vc + (self.kappa*(self.theta - vc) + lam)*dt + self.sigma*np.sqrt(vc)*dZ,
+                1e-8)
+            S_arr = S_arr * np.exp(-0.5*vc*dt + np.sqrt(vc)*dW)
+        payoffs = np.maximum(S_arr[:, None] - np.array(strikes)[None, :], 0.0)
+        return payoffs.mean(axis=0)
 
-#Black-Scholes Implied Volatility 
+# Black-Scholes Implied Volatility 
 
-#Compute implied volatility via Newton-Raphson
+# Compute implied volatility via Newton-Raphson
 def black_scholes_iv(S, K, T, price, r=0.0):
     if price <= max(S - K, 0):
         return 0.01
@@ -300,9 +333,9 @@ def black_scholes_iv(S, K, T, price, r=0.0):
     
     return sigma
 
-#Load unified data with:
-#Volatility surface
-#Price prediction features 
+# Load unified data with:
+# Volatility surface
+# Price prediction features 
 
 def load_unified_data(maturity_idx=3):
     
@@ -373,9 +406,11 @@ def load_unified_data(maturity_idx=3):
 #Particle Filter with conditional brenier
 
 class HybridCalibration:
-    def __init__(self, n_particles=200, n_weights=15, heston_params=None):
+    def __init__(self, n_particles=200, n_weights=15, heston_params=None,
+                 n_cpus=None):
         self.n_particles = n_particles
-        self.n_weights = n_weights
+        self.n_weights   = n_weights
+        self.n_cpus      = n_cpus or _N_CPUS
         
         if heston_params is None:
             heston_params = {
@@ -398,25 +433,33 @@ class HybridCalibration:
         self.particles = np.random.randn(self.n_particles, self.n_weights) * 0.1
         self.weights = np.ones(self.n_particles) / self.n_particles
     
-    #ESS = (Σw_i)² / Σw_i²
+    # ESS = (Σw_i)² / Σw_i²
     def effective_sample_size(self):
         return (np.sum(self.weights)**2) / np.sum(self.weights**2)
     
-    #Update weights based on likelihood
-    def reweight(self, market_price, strike, T, noise_std=0.3):
-        likelihoods = np.zeros(self.n_particles)
-        
-        for i in range(self.n_particles):
-            drift_weights = self.particles[i]
-            model_price = self.heston.price_calls(
-                [strike], T, n_paths=1000, weights=drift_weights
-            )[0]
-            likelihoods[i] = norm.pdf(market_price, loc=model_price, scale=noise_std)
-        
+    # Update weights based on likelihood
+    # All particles priced in parallel — each worker simulates a chunk
+    # with antithetic variates and vectorized drift.
+    def reweight(self, market_price, strike, T, noise_std=0.3,
+                 n_paths=1000, n_steps=50):
+        h = self.heston
+        chunk_size = max(1, self.n_particles // self.n_cpus)
+        chunks = [self.particles[i:i+chunk_size]
+                  for i in range(0, self.n_particles, chunk_size)]
+        args = [(chunk, h.S0, h.v0, h.kappa, h.theta, h.sigma, h.rho,
+                 strike, T, n_paths, n_steps)
+                for chunk in chunks]
+        if self.n_cpus > 1:
+            with Pool(self.n_cpus) as pool:
+                results = pool.map(_price_particle_chunk, args)
+        else:
+            results = [_price_particle_chunk(a) for a in args]
+        model_prices = np.concatenate(results)
+        likelihoods  = norm.pdf(market_price, loc=model_prices, scale=noise_std)
         self.weights *= likelihoods
         self.weights /= (np.sum(self.weights) + 1e-10)
     
-    #Systematic resampling when ESS low
+    # Systematic resampling when ESS low
     def resample(self, threshold=0.5):
         ess = self.effective_sample_size()
         
@@ -430,7 +473,7 @@ class HybridCalibration:
             return True
         return False
     
-    #MCMC move
+    # MCMC move
     def move(self, step_size=0.01):
         noise = np.random.randn(self.n_particles, self.n_weights) * step_size
         self.particles += noise
@@ -441,7 +484,9 @@ class HybridCalibration:
         for i, (K, C_mkt) in enumerate(zip(strikes, market_prices)):
             print(f"\n  Strike {i+1}/{len(strikes)}: K={K:.0f}, C={C_mkt:.4f}")
             
-            self.reweight(C_mkt, K, T, noise_std=0.3)
+            # noise_std scales with price — avoids ESS collapse on deep-ITM strikes
+            noise_std = max(0.05 * C_mkt, 0.05)
+            self.reweight(C_mkt, K, T, noise_std=noise_std)
             ess = self.effective_sample_size()
             print(f"ESS: {ess:.0f}/{self.n_particles}")
             
@@ -456,12 +501,12 @@ class HybridCalibration:
         
         return self.calibrated_drift
     
-    #Fit Conditional Brenier Map for price prediction.
-    #X1: ndarray, shape (n, d_features)
+    # Fit Conditional Brenier Map for price prediction.
+    # X1: ndarray, shape (n, d_features)
     # Past features (vol, momentum, IV, etc.)
-    #X2 : ndarray, shape (n, 3)
-    #Future targets (return, vol, drawdown)
-    #d1 : int - Number of conditioning features to use
+    # X2 : ndarray, shape (n, 3)
+    # Future targets (return, vol, drawdown)
+    # d1 : int - Number of conditioning features to use
    
     def fit_brenier_map(self, X1, X2, d1, t=0.01, epsilon=0.001):
     
@@ -503,7 +548,7 @@ class HybridCalibration:
 if __name__ == "__main__":
     np.random.seed(42)
  
-    #Load unified data
+    # Load unified data
     try:
         data = load_unified_data(maturity_idx=3)
     except FileNotFoundError as e:
@@ -511,7 +556,7 @@ if __name__ == "__main__":
         print("\n💡 Run: python generate_synthetic_data.py")
         exit(1)
     
-    #Extract data
+    # Extract data
     strikes = data['strikes']
     market_prices = data['market_prices']
     market_vols = data['market_vols']
@@ -531,22 +576,27 @@ if __name__ == "__main__":
     print(f"Features: {X1.shape[1]}")
     print(f"Targets: {X2.shape[1]} (return, vol, drawdown)")
     
-    #Initialize hybrid calibration
+    # Initialize hybrid calibration
     hybrid = HybridCalibration(
-        n_particles=200,
+        n_particles=500,
         n_weights=15,
         heston_params=heston_params
     )
     
-    #Calibrate drift
+    # Calibrate drift
     start_time = time.time()
     calibrated_drift = hybrid.calibrate_drift(strikes, market_prices, T)
     drift_time = time.time() - start_time
     
-    #Fit Brenier map
+    # Fit Brenier map
     start_time = time.time()
-    d1 = 7  #Use last 7 features - realized vol, current vol, momentum, etc
-    brenier = hybrid.fit_brenier_map(X1, X2, d1=d1, t=0.02, epsilon=0.004)
+    d1 = 7  # last 7 features: realized vol, current vol, momentum, etc.
+    # t and epsilon auto-tuned: t* = 0.1*n^(-1/3), epsilon* = t*^2
+    n_train = len(X1)
+    t_auto  = 0.1 * (n_train ** (-1/3))
+    eps_auto = t_auto ** 2
+    print(f"  Brenier auto-params: t={t_auto:.4f}  ε={eps_auto:.6f}")
+    brenier = hybrid.fit_brenier_map(X1, X2, d1=d1, t=t_auto, epsilon=eps_auto)
     brenier_time = time.time() - start_time
     
     print("Calibration Times")
@@ -554,7 +604,7 @@ if __name__ == "__main__":
     print(f"Brenier map fitting: {brenier_time:.1f}s")
     print(f"Total: {drift_time + brenier_time:.1f}s")
     
-    #Drift calibration accuracy
+    # Drift calibration accuracy
     
     model_prices = hybrid.heston.price_calls(strikes, T, n_paths=20000, 
                                             weights=calibrated_drift)
@@ -566,7 +616,7 @@ if __name__ == "__main__":
     print(f"MAE: {mae:.4f}")
     print(f"RMSE: {rmse:.4f}")
     
-    #Price prediction accuracy
+    # Price prediction accuracy
     
     # Test on subset
     n_test = min(500, len(X1))
@@ -582,7 +632,7 @@ if __name__ == "__main__":
     
     predictions = np.array(predictions)
     
-    #Compute metrics
+    # Compute metrics
     mse_return = np.mean((predictions[:, 0] - X2_test[:, 0])**2)
     mse_vol = np.mean((predictions[:, 1] - X2_test[:, 1])**2)
     mse_dd = np.mean((predictions[:, 2] - X2_test[:, 2])**2)
@@ -629,7 +679,7 @@ if __name__ == "__main__":
     
     fig = plt.figure(figsize=(18, 12))
     
-    #Plot 1: Price comparison
+    # Plot 1: Price comparison
     ax1 = plt.subplot(3, 4, 1)
     x_pos = np.arange(len(strikes))
     width = 0.35
@@ -643,7 +693,7 @@ if __name__ == "__main__":
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3, axis='y')
     
-    #Plot 2: Pricing errors
+    # Plot 2: Pricing errors
     ax2 = plt.subplot(3, 4, 2)
     ax2.plot(strikes, errors, 'o-', linewidth=2, markersize=8, color='red')
     ax2.fill_between(strikes, 0, errors, alpha=0.3, color='red')
@@ -653,7 +703,7 @@ if __name__ == "__main__":
                   fontsize=11, fontweight='bold')
     ax2.grid(True, alpha=0.3)
     
-    #Plot 3: IV comparison
+    # Plot 3: IV comparison
     ax3 = plt.subplot(3, 4, 3)
     model_vols = np.array([
         black_scholes_iv(heston_params['S0'], K, T, price)
@@ -669,7 +719,7 @@ if __name__ == "__main__":
     ax3.legend(fontsize=9)
     ax3.grid(True, alpha=0.3)
     
-    #Plot 4: Learned drift weights
+    # Plot 4: Learned drift weights
     ax4 = plt.subplot(3, 4, 4)
     ax4.bar(range(len(calibrated_drift)), calibrated_drift, 
             alpha=0.7, color='green')
@@ -679,7 +729,7 @@ if __name__ == "__main__":
     ax4.axhline(0, color='black', linestyle='-', linewidth=0.5)
     ax4.grid(True, alpha=0.3, axis='y')
     
-    #Plot 5: Return prediction scatter
+    # Plot 5: Return prediction scatter
     ax5 = plt.subplot(3, 4, 5)
     ax5.scatter(X2_test[:, 0], predictions[:, 0], alpha=0.4, s=15)
     lim_min = min(X2_test[:, 0].min(), predictions[:, 0].min())
@@ -693,7 +743,7 @@ if __name__ == "__main__":
     ax5.legend(fontsize=9)
     ax5.grid(True, alpha=0.3)
     
-    #Plot 6: Volatility prediction scatter
+    # Plot 6: Volatility prediction scatter
     ax6 = plt.subplot(3, 4, 6)
     ax6.scatter(X2_test[:, 1], predictions[:, 1], alpha=0.4, s=15, color='green')
     lim_min = min(X2_test[:, 1].min(), predictions[:, 1].min())
@@ -706,7 +756,7 @@ if __name__ == "__main__":
                   fontsize=11, fontweight='bold')
     ax6.grid(True, alpha=0.3)
     
-    #Plot 7: Drawdown prediction scatter
+    # Plot 7: Drawdown prediction scatter
     ax7 = plt.subplot(3, 4, 7)
     ax7.scatter(X2_test[:, 2], predictions[:, 2], alpha=0.4, s=15, color='purple')
     lim_min = min(X2_test[:, 2].min(), predictions[:, 2].min())
@@ -719,7 +769,7 @@ if __name__ == "__main__":
                   fontsize=11, fontweight='bold')
     ax7.grid(True, alpha=0.3)
     
-    #Plot 8: Prediction errors histogram
+    # Plot 8: Prediction errors histogram
     ax8 = plt.subplot(3, 4, 8)
     return_errors = predictions[:, 0] - X2_test[:, 0]
     ax8.hist(return_errors, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
@@ -837,42 +887,57 @@ Data:
     
     output_file2 = 'conditional_distributions_2d.png'
     plt.savefig(output_file2, dpi=150, bbox_inches='tight')
-    print(f"  ✓ Saved: {output_file2}")
+    print(f"Saved: {output_file2}")
     
-    #Convergence Analysis
+    # Convergence Analysis
 
-    #Test with different sample sizes
-    sample_sizes = [500, 1000, 2000, 3000, len(X1)]
+    # Hold out a fixed test set BEFORE subsampling. Without this, when
+    # n == len(X1) the test queries are inside training and W₂ collapses.
+    n_conv_test = 300
+    all_idx = np.arange(len(X1))
+    conv_test_idx  = np.random.choice(all_idx, n_conv_test, replace=False)
+    conv_train_pool = np.setdiff1d(all_idx, conv_test_idx)
+
+    X1_conv_test = X1[conv_test_idx, -d1:]
+    X2_conv_test = X2[conv_test_idx]
+
+    max_n = len(conv_train_pool)
+    sample_sizes = [s for s in [500, 1000, 2000] if s <= max_n]
+    if max_n not in sample_sizes:
+        sample_sizes.append(max_n)
+
     t_values = [0.1 * (n ** (-1/3)) for n in sample_sizes]
-    epsilon_values = [t**2 for t in t_values]
-    
+
     print(f"\n Testing convergence with varying sample sizes")
-    
+    print(f"Held-out test: {n_conv_test} samples (disjoint from training)")
+
     errors_by_size = []
-    
-    for n, t_param, eps_param in zip(sample_sizes, t_values, epsilon_values):
-        print(f"\n    n={n}, t={t_param:.4f}, ε={eps_param:.6f}")
-        
-        #Subsample data
-        indices = np.random.choice(len(X1), min(n, len(X1)), replace=False)
-        X1_sub = X1[indices, -d1:]
-        X2_sub = X2[indices]
-        
-        #Fit Brenier with these parameters
-        brenier_temp = ConditionalBrenierEstimator(d1=d1, d2=3, 
-                                                    t=t_param, epsilon=eps_param)
+
+    for n, t_param in zip(sample_sizes, t_values):
+        #Subsample strictly from training pool
+        train_idx = np.random.choice(conv_train_pool, n, replace=False)
+        X1_sub = X1[train_idx, -d1:]
+        X2_sub = X2[train_idx]
+
+        #Auto-scale epsilon identically to how fit_brenier_map does it
+        d_full = d1 + X2_sub.shape[1]
+        A_t = np.eye(d_full)
+        A_t[d1:, d1:] *= np.sqrt(t_param)
+        Z = np.hstack([X1_sub, X2_sub]) @ A_t
+        mean_sq_dist = np.mean(np.sum(Z**2, axis=1))
+        eps_param = t_param**2 * max(mean_sq_dist, 0.01)
+
+        print(f"\n n={n}, t={t_param:.4f}, ε={eps_param:.6f}")
+
+        brenier_temp = ConditionalBrenierEstimator(
+            d1=d1, d2=3, t=t_param, epsilon=eps_param
+        )
         brenier_temp.fit(X1_sub, X2_sub)
-        
-        #Test error
-        test_indices = np.random.choice(len(X1), 200, replace=False)
-        X1_test_conv = X1[test_indices, -d1:]
-        X2_test_conv = X2[test_indices]
-        
+
         w2_error_temp = brenier_temp.compute_wasserstein_error(
-            X1_test_conv, X2_test_conv
+            X1_conv_test, X2_conv_test
         )
         errors_by_size.append(w2_error_temp)
-        
         print(f"W₂ error: {w2_error_temp:.6f}")
     
     #Plot convergence rate

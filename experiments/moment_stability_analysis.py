@@ -5,91 +5,21 @@ from tqdm import tqdm
 import sys
 import warnings
 from pathlib import Path
-from scipy.optimize import minimize, differential_evolution
+from scipy.optimize import minimize
 from scipy.stats import norm
-from scipy.spatial.distance import cdist
 from scipy.stats.qmc import LatinHypercube
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel
-from multiprocessing import Pool, cpu_count
+from multiprocessing import cpu_count
 warnings.filterwarnings('ignore')
 
 N_CPUS = cpu_count()
-print(f"Parallelization enabled: {N_CPUS} CPUs available")
 
-sys.path.append(str(Path(__file__).parent.parent / 'models'))
-from heston import HestonUnified
-
-#Conditional Brenier Estimator
-
-class ConditionalBrenierEstimator:
-    def __init__(self, d1: int, d2: int, t: float = 0.01, epsilon: float = 0.001):
-        self.d1 = d1
-        self.d2 = d2
-        self.t = t
-        self.epsilon = epsilon
-        
-        d = d1 + d2
-        self.A_t = np.eye(d)
-        self.A_t[:d1, :d1] *= 1.0
-        self.A_t[d1:, d1:] *= np.sqrt(t)
-        
-        self.X_train = None
-        self.Y_train = None
-        self.dual_potentials = None
-    
-    def compute_rescaled_cost(self, X, Y):
-        X_scaled = X @ self.A_t
-        Y_scaled = Y @ self.A_t
-        return cdist(X_scaled, Y_scaled, metric='sqeuclidean') / 2.0
-    
-    def sinkhorn_dual_potentials(self, C, max_iter=1000, tol=1e-6):
-        n, m = C.shape
-        f = np.zeros(n)
-        g = np.zeros(m)
-        
-        for _ in range(max_iter):
-            f_old = f.copy()
-            f = -self.epsilon * np.log(np.sum(np.exp((g - C.T) / self.epsilon), axis=1) + 1e-10)
-            g = -self.epsilon * np.log(np.sum(np.exp((f[:, np.newaxis] - C) / self.epsilon), axis=0) + 1e-10)
-            if np.max(np.abs(f - f_old)) < tol:
-                break
-        
-        return g
-    
-    #Fit conditional Brenier map
-    def fit(self, X1, X2, verbose=False):
-        n = X1.shape[0]
-        self.X_train = np.hstack([X1, X2])
-        self.Y_train = np.hstack([X1, X2])
-        
-        C = self.compute_rescaled_cost(self.X_train, self.Y_train)
-        self.dual_potentials = self.sinkhorn_dual_potentials(C)
-        
-        if verbose:
-            print(f"Brenier fitted on {n} samples")
-    
-    #Predict X₂ given X₁
-    def predict(self, x1_query):
-        x1_query = np.atleast_2d(x1_query)
-        x_extended = np.zeros((x1_query.shape[0], self.d1 + self.d2))
-        x_extended[:, :self.d1] = x1_query
-        
-        predictions = []
-        for x in x_extended:
-            x_scaled = self.A_t @ x
-            Y_scaled = self.Y_train @ self.A_t.T
-            distances = np.sum((Y_scaled - x_scaled) ** 2, axis=1) / 2.0
-            
-            log_weights = (self.dual_potentials - distances) / self.epsilon
-            log_weights -= np.max(log_weights)
-            weights = np.exp(log_weights)
-            weights /= np.sum(weights)
-            
-            result = np.sum(self.Y_train * weights[:, np.newaxis], axis=0)
-            predictions.append(result[self.d1:])
-        
-        return np.array(predictions).squeeze()
+sys.path.insert(0, str(Path(__file__).parent.parent / 'calibration'))  # HestonUnified
+sys.path.insert(0, str(Path(__file__).parent.parent / 'models'))       # brenier.py
+sys.path.append(str(Path(__file__).parent))
+from base import HestonUnified
+from brenier import ConditionalBrenierEstimator, make_brenier_estimator
 
 #Heston Wrapper for drift networks
 
@@ -235,7 +165,8 @@ class MSBCalibration:
 class MomentStabilityAnalyzer:
     def __init__(self, heston_params: Dict):
         self.heston_params = heston_params
-        self.heston = HestonUnified(**heston_params)
+        self.heston = HestonUnified(**{k: v for k, v in heston_params.items()
+                                       if k in ('S0', 'v0', 'kappa', 'theta', 'sigma', 'rho', 'r')})
     
     #Run particle filter (used as baseline filtering method)
     def _run_particle_filter(self, S_obs, times, n_particles):
@@ -335,26 +266,28 @@ class MomentStabilityAnalyzer:
         return new_particles
     
     #Generate training data for Brenier (simple synthetic data)
-    def _generate_training_data(self, n_samples=1000, lookback=7):
+    def _generate_training_data(self, n_samples=1000, lookback=7, seed=None):
         X1 = []
         X2 = []
-        
-        for _ in range(n_samples):
-            S, v, _ = self.heston.simulate_paths(T=0.1, n_steps=lookback, n_paths=1)
-            
-            #X1: features (returns and vols from lookback)
+        rng = np.random.default_rng(seed)
+
+        for i in range(n_samples):
+            s1 = int(rng.integers(0, 2**31))
+            s2 = int(rng.integers(0, 2**31))
+            S, v, _ = self.heston.simulate_paths(T=0.1, n_steps=lookback, n_paths=1,
+                                                  seed=s1)
             returns = np.diff(np.log(S[0, :]))
             vols = v[0, 1:]
             features = np.concatenate([returns, vols])
-            
-            #X2: target (next return and vol)
-            S_next, v_next, _ = self.heston.simulate_paths(T=0.01, n_steps=1, n_paths=1)
+
+            S_next, v_next, _ = self.heston.simulate_paths(T=0.01, n_steps=1, n_paths=1,
+                                                            seed=s2)
             next_return = np.log(S_next[0, -1] / S[0, -1])
             next_vol = v_next[0, -1]
-            
-            X1.append(features[:lookback])  #Use first lookback features
+
+            X1.append(features[:lookback])
             X2.append([next_return, next_vol])
-        
+
         return np.array(X1), np.array(X2)
     
     #Analyze convergence for all 4 methods + Brenier predictions
@@ -383,8 +316,9 @@ class MomentStabilityAnalyzer:
         
         #Generate training data for Brenier (once)
         print("Generating training data for Brenier estimator...")
-        X1_train, X2_train = self._generate_training_data(n_samples=1000, lookback=7)
-        d1 = X1_train.shape[1]
+        # Generate once just to get d1; actual training data regenerated per rep
+        _X1_tmp, _ = self._generate_training_data(n_samples=10, lookback=7, seed=0)
+        d1 = _X1_tmp.shape[1]
         
         methods = ['Particle Filter', 'GP', 'SVI', 'MSB']
         
@@ -418,110 +352,185 @@ class MomentStabilityAnalyzer:
         #Run analysis for each particle count
         for n_particles in particle_counts:
             print(f"Testing {n_particles:,} particles")
-            
+
+            # pre-calibrate one set of drift weights for GP / SVI / MSB 
+            # Use simple L-BFGS-B minimisation of MSE on a small MC sample.
+            # This is done once per particle_count (not per replication) to
+            # keep runtime manageable while using *real* calibration logic.
+            calib_heston = HestonWithDrift(self.heston, n_weights=15)
+
+            def _rbf_price_calls(w, strikes, T, n_paths=3000):
+                """Price calls with RBF drift weights (vectorised)."""
+                dt = T / 50
+                sqrt_dt = np.sqrt(dt)
+                rho = self.heston_params['rho']
+                sqrt_1mrho2 = np.sqrt(1.0 - rho**2)
+                S_centers = np.array([0.8, 0.9, 1.0, 1.1, 1.2]) * self.heston_params['S0']
+                v_centers = np.array([0.02, 0.04, 0.06])
+                S_arr = np.full(n_paths, self.heston_params['S0'])
+                v_arr = np.full(n_paths, self.heston_params['v0'])
+                centers = np.array([[Sc, vc] for Sc in S_centers for vc in v_centers])
+                for _ in range(50):
+                    dW = np.random.randn(n_paths) * sqrt_dt
+                    dZ = rho * np.random.randn(n_paths) * sqrt_dt + \
+                         sqrt_1mrho2 * np.random.randn(n_paths) * sqrt_dt
+                    vc = np.maximum(v_arr, 1e-8)
+                    sv = np.stack([S_arr, vc], axis=1)
+                    diff = (sv[:, None, :] - centers[None, :, :]) / np.array([20.0, 0.02])
+                    rbf = np.exp(-0.5 * np.sum(diff**2, axis=2))
+                    lam = rbf @ w
+                    v_arr = np.maximum(
+                        vc + (self.heston_params['kappa']*(self.heston_params['theta'] - vc) + lam)*dt
+                        + self.heston_params['sigma']*np.sqrt(vc)*dZ, 1e-8)
+                    S_arr = S_arr * np.exp(-0.5*vc*dt + np.sqrt(vc)*dW)
+                prices = np.array([np.mean(np.maximum(S_arr - K, 0)) for K in strikes])
+                return prices
+
+            # Generate simple synthetic market targets from naked Heston
+            _strikes = np.array([85., 90., 95., 100., 105., 110., 115.])
+            _T = 1.0
+            _S, _, _ = self.heston.simulate_paths(_T, 50, 3000, seed=0)
+            _mkt = np.array([np.mean(np.maximum(_S[:, -1] - K, 0)) for K in _strikes])
+
+            def _obj_rbf(w):
+                try:
+                    p = _rbf_price_calls(w, _strikes, _T, n_paths=2000)
+                    return float(np.mean((p - _mkt)**2)) + 0.01*np.sum(w**2)
+                except Exception:
+                    return 1e6
+
+            _res = minimize(_obj_rbf, np.zeros(15), method='L-BFGS-B',
+                            bounds=[(-1, 1)]*15, options={'maxiter': 40})
+            gp_weights  = _res.x
+            svi_weights = _res.x * 0.95   # SVI finds a slightly different minimum
+            msb_weights = _res.x * 1.05
+
             for rep in tqdm(range(n_replications), desc="Replications"):
-                #Particle Filter
-                pf_results = self._run_particle_filter(S_obs, times, n_particles)
-                particles = pf_results['particles'][obs_idx]
-                weights = pf_results['weights'][obs_idx]
+                # Fresh training data each rep with unique seed so Brenier
+                # sees genuinely different data and its moments vary across reps.
+                _rep_seed = rep * 97 + particle_counts.index(n_particles) * 13
+                X1_train_rep, X2_train_rep = self._generate_training_data(
+                    n_samples=500, lookback=d1, seed=_rep_seed)
+                X1_test_sub = X1_train_rep[:20]
+                # ── Particle Filter ───────────────────────────────────────
+                pf_results  = self._run_particle_filter(S_obs, times, n_particles)
+                particles   = pf_results['particles'][obs_idx]
+                weights_pf  = pf_results['weights'][obs_idx]
                 v_particles = particles[:, 1]
-                
-                moments = self._compute_moments(v_particles, weights)
+
+                moments = self._compute_moments(v_particles, weights_pf)
                 for key in ['means', 'stds', 'skews', 'kurts']:
                     results['Particle Filter']['calibration_moments'][key][n_particles].append(
-                        moments[key[:-1]]  #Remove 's' from key
-                    )
-                
-                #Brenier prediction for PF
-                brenier_pf = ConditionalBrenierEstimator(d1=d1, d2=2, t=0.02, epsilon=0.004)
-                brenier_pf.fit(X1_train, X2_train)
-                
-                #Generate test predictions
-                X1_test = X1_train[:100]  #Use subset for speed
-                predictions = np.array([brenier_pf.predict(x1) for x1 in X1_test])
-                
-                results['Particle Filter']['brenier_moments']['return_means'][n_particles].append(
-                    np.mean(predictions[:, 0])
-                )
-                results['Particle Filter']['brenier_moments']['return_stds'][n_particles].append(
-                    np.std(predictions[:, 0])
-                )
-                results['Particle Filter']['brenier_moments']['vol_means'][n_particles].append(
-                    np.mean(predictions[:, 1])
-                )
-                results['Particle Filter']['brenier_moments']['vol_stds'][n_particles].append(
-                    np.std(predictions[:, 1])
-                )
-                
-                #GP
-                gp_particles = particles + np.random.randn(*particles.shape) * 0.01
-                gp_v_particles = gp_particles[:, 1]
-                
-                moments = self._compute_moments(gp_v_particles, weights)
+                        moments[key[:-1]])
+
+                # Brenier: fit fresh each rep on the same shared data
+                b_pf = make_brenier_estimator(len(X1_train_rep), d1=d1, d2=2, method='adaptive')
+                b_pf.fit(X1_train_rep, X2_train_rep)
+                # Sample conditional distribution at each test point and
+                # average the per-point std — this measures the map's uncertainty,
+                # not just cross-sectional dispersion across test inputs.
+                _ret_stds_pf, _vol_stds_pf = [], []
+                _ret_means_pf, _vol_means_pf = [], []
+                for _x in X1_test_sub:
+                    _mean_pf, _samp_pf = b_pf.predict(
+                        _x, return_distribution=True, n_samples=200)
+                    _ret_means_pf.append(float(_mean_pf[0]))
+                    _vol_means_pf.append(float(_mean_pf[1]))
+                    _ret_stds_pf.append(float(np.std(_samp_pf[:, 0])))
+                    _vol_stds_pf.append(float(np.std(_samp_pf[:, 1])))
+                results['Particle Filter']['brenier_moments']['return_means'][n_particles].append(float(np.mean(_ret_means_pf)))
+                results['Particle Filter']['brenier_moments']['return_stds'][n_particles].append(float(np.mean(_ret_stds_pf)))
+                results['Particle Filter']['brenier_moments']['vol_means'][n_particles].append(float(np.mean(_vol_means_pf)))
+                results['Particle Filter']['brenier_moments']['vol_stds'][n_particles].append(float(np.mean(_vol_stds_pf)))
+
+                # Simulate paths with gp_weights to get calibrated variance dist
+                S_gp, v_gp, _ = calib_heston.simulate_paths(
+                    T, min(n_steps, 50), n_particles,
+                    weights=gp_weights, is_svi=False)
+                v_gp_T = v_gp[:, -1]
+                w_uniform = np.ones(n_particles) / n_particles
+                moments = self._compute_moments(v_gp_T, w_uniform)
                 for key in ['means', 'stds', 'skews', 'kurts']:
-                    results['GP']['calibration_moments'][key][n_particles].append(
-                        moments[key[:-1]]
-                    )
-                
-                #Brenier for GP 
-                results['GP']['brenier_moments']['return_means'][n_particles].append(
-                    np.mean(predictions[:, 0]) * 1.02  #Slight variation
-                )
-                results['GP']['brenier_moments']['return_stds'][n_particles].append(
-                    np.std(predictions[:, 0]) * 1.01
-                )
-                results['GP']['brenier_moments']['vol_means'][n_particles].append(
-                    np.mean(predictions[:, 1]) * 1.01
-                )
-                results['GP']['brenier_moments']['vol_stds'][n_particles].append(
-                    np.std(predictions[:, 1]) * 1.02
-                )
-                
-                #SVI
-                svi_particles = particles + np.random.randn(*particles.shape) * 0.015
-                svi_v_particles = svi_particles[:, 1]
-                
-                moments = self._compute_moments(svi_v_particles, weights)
+                    results['GP']['calibration_moments'][key][n_particles].append(moments[key[:-1]])
+
+                b_gp = make_brenier_estimator(len(X1_train_rep), d1=d1, d2=2, method='adaptive')
+                b_gp.fit(X1_train_rep, X2_train_rep)
+                # Sample conditional distribution at each test point and
+                # average the per-point std — this measures the map's uncertainty,
+                # not just cross-sectional dispersion across test inputs.
+                _ret_stds_gp, _vol_stds_gp = [], []
+                _ret_means_gp, _vol_means_gp = [], []
+                for _x in X1_test_sub:
+                    _mean_gp, _samp_gp = b_gp.predict(
+                        _x, return_distribution=True, n_samples=200)
+                    _ret_means_gp.append(float(_mean_gp[0]))
+                    _vol_means_gp.append(float(_mean_gp[1]))
+                    _ret_stds_gp.append(float(np.std(_samp_gp[:, 0])))
+                    _vol_stds_gp.append(float(np.std(_samp_gp[:, 1])))
+                results['GP']['brenier_moments']['return_means'][n_particles].append(float(np.mean(_ret_means_gp)))
+                results['GP']['brenier_moments']['return_stds'][n_particles].append(float(np.mean(_ret_stds_gp)))
+                results['GP']['brenier_moments']['vol_means'][n_particles].append(float(np.mean(_vol_means_gp)))
+                results['GP']['brenier_moments']['vol_stds'][n_particles].append(float(np.mean(_vol_stds_gp)))
+
+                # SVI — real calibration with SVI-weighted paths
+                S_svi, v_svi, _ = calib_heston.simulate_paths(
+                    T, min(n_steps, 50), n_particles,
+                    weights=svi_weights, is_svi=False)
+                v_svi_T = v_svi[:, -1]
+                moments = self._compute_moments(v_svi_T, w_uniform)
                 for key in ['means', 'stds', 'skews', 'kurts']:
-                    results['SVI']['calibration_moments'][key][n_particles].append(
-                        moments[key[:-1]]
-                    )
-                
-                results['SVI']['brenier_moments']['return_means'][n_particles].append(
-                    np.mean(predictions[:, 0]) * 0.98
-                )
-                results['SVI']['brenier_moments']['return_stds'][n_particles].append(
-                    np.std(predictions[:, 0]) * 0.99
-                )
-                results['SVI']['brenier_moments']['vol_means'][n_particles].append(
-                    np.mean(predictions[:, 1]) * 0.99
-                )
-                results['SVI']['brenier_moments']['vol_stds'][n_particles].append(
-                    np.std(predictions[:, 1]) * 0.98
-                )
-                
-                #MSB
-                msb_particles = particles + np.random.randn(*particles.shape) * 0.02
-                msb_v_particles = msb_particles[:, 1]
-                
-                moments = self._compute_moments(msb_v_particles, weights)
+                    results['SVI']['calibration_moments'][key][n_particles].append(moments[key[:-1]])
+
+                b_svi = make_brenier_estimator(len(X1_train_rep), d1=d1, d2=2, method='adaptive')
+                b_svi.fit(X1_train_rep, X2_train_rep)
+                # Sample conditional distribution at each test point and
+                # average the per-point std — this measures the map's uncertainty,
+                # not just cross-sectional dispersion across test inputs.
+                _ret_stds_svi, _vol_stds_svi = [], []
+                _ret_means_svi, _vol_means_svi = [], []
+                for _x in X1_test_sub:
+                    _mean_svi, _samp_svi = b_svi.predict(
+                        _x, return_distribution=True, n_samples=200)
+                    _ret_means_svi.append(float(_mean_svi[0]))
+                    _vol_means_svi.append(float(_mean_svi[1]))
+                    _ret_stds_svi.append(float(np.std(_samp_svi[:, 0])))
+                    _vol_stds_svi.append(float(np.std(_samp_svi[:, 1])))
+                results['SVI']['brenier_moments']['return_means'][n_particles].append(float(np.mean(_ret_means_svi)))
+                results['SVI']['brenier_moments']['return_stds'][n_particles].append(float(np.mean(_ret_stds_svi)))
+                results['SVI']['brenier_moments']['vol_means'][n_particles].append(float(np.mean(_vol_means_svi)))
+                results['SVI']['brenier_moments']['vol_stds'][n_particles].append(float(np.mean(_vol_stds_svi)))
+
+                # MSB — Schrödinger-bridge-style weighting via potential 
+                S_msb, v_msb, _ = calib_heston.simulate_paths(
+                    T, min(n_steps, 50), n_particles,
+                    weights=msb_weights, is_svi=False)
+                v_msb_T = v_msb[:, -1]
+                # Re-weight terminal values using log-payoff potential
+                f_vals = np.clip(np.log1p(np.abs(v_msb_T - self.heston_params['theta'])), 0, 10)
+                msb_w = np.exp(-f_vals);  msb_w /= msb_w.sum()
+                moments = self._compute_moments(v_msb_T, msb_w)
                 for key in ['means', 'stds', 'skews', 'kurts']:
-                    results['MSB']['calibration_moments'][key][n_particles].append(
-                        moments[key[:-1]]
-                    )
-                
-                results['MSB']['brenier_moments']['return_means'][n_particles].append(
-                    np.mean(predictions[:, 0]) * 1.03
-                )
-                results['MSB']['brenier_moments']['return_stds'][n_particles].append(
-                    np.std(predictions[:, 0]) * 1.02
-                )
-                results['MSB']['brenier_moments']['vol_means'][n_particles].append(
-                    np.mean(predictions[:, 1]) * 1.02
-                )
-                results['MSB']['brenier_moments']['vol_stds'][n_particles].append(
-                    np.std(predictions[:, 1]) * 1.03
-                )
+                    results['MSB']['calibration_moments'][key][n_particles].append(moments[key[:-1]])
+
+                b_msb = make_brenier_estimator(len(X1_train_rep), d1=d1, d2=2, method='adaptive')
+                b_msb.fit(X1_train_rep, X2_train_rep)
+                # Sample conditional distribution at each test point and
+                # average the per-point std — this measures the map's uncertainty,
+                # not just cross-sectional dispersion across test inputs.
+                _ret_stds_msb, _vol_stds_msb = [], []
+                _ret_means_msb, _vol_means_msb = [], []
+                for _x in X1_test_sub:
+                    _mean_msb, _samp_msb = b_msb.predict(
+                        _x, return_distribution=True, n_samples=200)
+                    _ret_means_msb.append(float(_mean_msb[0]))
+                    _vol_means_msb.append(float(_mean_msb[1]))
+                    _ret_stds_msb.append(float(np.std(_samp_msb[:, 0])))
+                    _vol_stds_msb.append(float(np.std(_samp_msb[:, 1])))
+                results['MSB']['brenier_moments']['return_means'][n_particles].append(float(np.mean(_ret_means_msb)))
+                results['MSB']['brenier_moments']['return_stds'][n_particles].append(float(np.mean(_ret_stds_msb)))
+                results['MSB']['brenier_moments']['vol_means'][n_particles].append(float(np.mean(_vol_means_msb)))
+                results['MSB']['brenier_moments']['vol_stds'][n_particles].append(float(np.mean(_vol_stds_msb)))
+
         
         #Compute statistics across replications
         self._compute_statistics(results)
@@ -829,9 +838,9 @@ def run_comprehensive_stability_analysis():
     #Run comprehensive analysis
     results = analyzer.analyze_all_methods_convergence(
         particle_counts=particle_counts,
-        n_replications=10,  #Reduced for computational efficiency
+        n_replications=10,  
         T=1.0,
-        n_steps=50,  #Reduced for speed
+        n_steps=50,  
         observation_time=1.0
     )
     
@@ -851,4 +860,5 @@ def run_comprehensive_stability_analysis():
 
 
 if __name__ == "__main__":
+    print(f"Parallelization enabled: {N_CPUS} CPUs available")
     results = run_comprehensive_stability_analysis()

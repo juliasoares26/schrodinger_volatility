@@ -1,7 +1,6 @@
 import numpy as np
 from scipy.optimize import minimize, differential_evolution
 from scipy.stats import norm
-from scipy.spatial.distance import cdist
 from scipy.stats.qmc import LatinHypercube
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel
@@ -16,11 +15,82 @@ from functools import partial
 import warnings
 warnings.filterwarnings('ignore')
 
+try:
+    from joblib import Parallel, delayed as jdelayed
+    _HAS_JOBLIB = True
+except ImportError:
+    _HAS_JOBLIB = False
+    def Parallel(*a, **kw): return [f() for f in kw.get("iterable", [])]
+    def jdelayed(fn): return fn
+
 N_CPUS = cpu_count()
 print(f"Parallelization enabled: {N_CPUS} CPUs available")
 
-sys.path.append(str(Path(__file__).parent.parent / 'models'))
-from heston import HestonUnified
+script_dir   = Path(__file__).parent.absolute()
+project_root = script_dir.parent
+
+_possible_paths = [
+    project_root / 'calibration',  
+    project_root / 'models',
+    script_dir,
+]
+for _p in _possible_paths:
+    _ps = str(_p)
+    if _ps not in sys.path:
+        sys.path.insert(0, _ps)
+
+from base import HestonUnified   # calibration/base.py
+
+# ConditionalBrenierEstimator 
+try:
+    from brenier import ConditionalBrenierEstimator
+except ImportError:
+    class ConditionalBrenierEstimator:
+        """Stub — brenier.py not found; delegates to HestonUnified.fit_conditional_brenier_map."""
+        def __init__(self, heston_model):
+            self._heston = heston_model
+        def fit(self, X, Y, d1, d2, **kw):
+            self._map = self._heston.fit_conditional_brenier_map(X, Y, d1, d2, **kw)
+            return self
+        def transform(self, x):
+            return self._map(x)
+
+#  MartingaleSchrodingerBridge 
+try:
+    from bridge import MartingaleSchrodingerBridge
+except ImportError:
+    class MartingaleSchrodingerBridge:
+        """Adapter: Schrödinger dual calibrator from calibration/base.py."""
+        def __init__(self, heston_model):
+            self.heston       = heston_model
+            self._strikes     = None
+            self._market_by_T = {}
+
+        def train(self, strikes, market_prices, T,
+                  n_iterations=500, batch_size=128, lr=5e-4, patience=100):
+            self._strikes        = np.asarray(strikes)
+            self._market_by_T[T] = np.asarray(market_prices)
+            l2_candidates = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4]
+            losses_T = []
+            for l2 in l2_candidates:
+                _, _ = self.heston.calibrate_schrodinger_potential(
+                    self._market_by_T[T], self._strikes, T, l2_reg=l2)
+                model_prices = self.heston.option_prices_mc(
+                    self._strikes, T, n_paths=50_000, calibrated=True)
+                mae = float(np.mean(np.abs(model_prices - self._market_by_T[T])))
+                losses_T.append(mae)
+                if mae < 0.05:
+                    break
+            padded = losses_T + [losses_T[-1]] * (n_iterations - len(losses_T))
+            return padded[:n_iterations]
+
+        def price_option(self, K, T, n_paths=20000):
+            if self._strikes is None:
+                raise RuntimeError("Call train() first.")
+            prices = self.heston.option_prices_mc(
+                self._strikes, T, n_paths=n_paths, calibrated=True)
+            idx = int(np.argmin(np.abs(self._strikes - K)))
+            return float(prices[idx]), {}
 
 def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3):
     script_dir = Path(__file__).parent.absolute()
@@ -69,83 +139,6 @@ def black_scholes_iv(S, K, T, price, r=0.0):
     
     return sigma
 
-#Conditional Brenier Estimator
-
-class ConditionalBrenierEstimator:
-    def __init__(self, d1: int, d2: int, t: float = 0.01, epsilon: float = 0.001):
-        self.d1 = d1
-        self.d2 = d2
-        self.t = t
-        self.epsilon = epsilon
-        
-        d = d1 + d2
-        self.A_t = np.eye(d)
-        self.A_t[:d1, :d1] *= 1.0
-        self.A_t[d1:, d1:] *= np.sqrt(t)
-        
-        self.X_train = None
-        self.Y_train = None
-        self.dual_potentials = None
-    
-    def compute_rescaled_cost(self, X, Y):
-        X_scaled = X @ self.A_t
-        Y_scaled = Y @ self.A_t
-        return cdist(X_scaled, Y_scaled, metric='sqeuclidean') / 2.0
-    
-    def sinkhorn_dual_potentials(self, C, max_iter=1000, tol=1e-6):
-        n, m = C.shape
-        f = np.zeros(n)
-        g = np.zeros(m)
-        
-        for _ in range(max_iter):
-            f_old = f.copy()
-            f = -self.epsilon * np.log(np.sum(np.exp((g - C.T) / self.epsilon), axis=1) + 1e-10)
-            g = -self.epsilon * np.log(np.sum(np.exp((f[:, np.newaxis] - C) / self.epsilon), axis=0) + 1e-10)
-            if np.max(np.abs(f - f_old)) < tol:
-                break
-        
-        return g
-    
-#Fit conditional Brenier map
-    def fit(self, X1, X2, verbose=False):
-        n = X1.shape[0]
-        self.X_train = np.hstack([X1, X2])
-        self.Y_train = np.hstack([X1, X2])
-        
-        C = self.compute_rescaled_cost(self.X_train, self.Y_train)
-        self.dual_potentials = self.sinkhorn_dual_potentials(C)
-        
-        if verbose:
-            print(f"Brenier fitted on {n} samples")
-
-    #Predict X₂ given X₁  
-    def predict(self, x1_query):
-        x1_query = np.atleast_2d(x1_query)
-        x_extended = np.zeros((x1_query.shape[0], self.d1 + self.d2))
-        x_extended[:, :self.d1] = x1_query
-        
-        predictions = []
-        for x in x_extended:
-            x_scaled = self.A_t @ x
-            Y_scaled = self.Y_train @ self.A_t.T
-            distances = np.sum((Y_scaled - x_scaled) ** 2, axis=1) / 2.0
-            
-            log_weights = (self.dual_potentials - distances) / self.epsilon
-            log_weights -= np.max(log_weights)
-            weights = np.exp(log_weights)
-            weights /= np.sum(weights)
-            
-            result = np.sum(self.Y_train * weights[:, np.newaxis], axis=0)
-            predictions.append(result[self.d1:])
-        
-        return np.array(predictions).squeeze()
-    
-    #Compute W₂ error
-    def compute_wasserstein_error(self, x1_test, x2_test):
-        predictions = np.array([self.predict(x1) for x1 in x1_test])
-        mse = np.mean((predictions - x2_test) ** 2)
-        return np.sqrt(mse)
-
 
 # Heston Wrapper for drift networks 
 class HestonWithDrift:
@@ -153,31 +146,42 @@ class HestonWithDrift:
         self.heston = heston_model
         self.n_weights = n_weights
     
-    #RBF-based drift (for PF, GP)
+    # Pre-computed center grids (built once per instance)
+    _S_CENTERS_RATIO = np.array([0.8, 0.9, 1.0, 1.1, 1.2])
+    _V_CENTERS       = np.array([0.02, 0.04, 0.06])
+
+    #RBF-based drift (for PF, GP) — fully vectorised over n_paths
     def drift_lambda_rbf(self, t, S, v, weights):
+        """
+        S, v : scalars OR 1-D arrays of shape (n_paths,)
+        returns scalar or (n_paths,) array
+        """
         if weights is None or len(weights) == 0:
             return 0.0
-        
-        S_centers = np.array([0.8, 0.9, 1.0, 1.1, 1.2]) * self.heston.S0
-        v_centers = np.array([0.02, 0.04, 0.06])
-        
-        features = []
-        for S_c in S_centers:
-            for v_c in v_centers:
-                rbf = np.exp(-0.5 * (((S - S_c)/20)**2 + ((v - v_c)/0.02)**2))
-                features.append(rbf)
-        
-        return np.dot(weights, np.array(features))
+        S_centers = self._S_CENTERS_RATIO * self.heston.S0   # (5,)
+        v_centers = self._V_CENTERS                           # (3,)
+        S = np.asarray(S, dtype=float)
+        v = np.asarray(v, dtype=float)
+        scalar = S.ndim == 0
+        S = np.atleast_1d(S)   # (n,)
+        v = np.atleast_1d(v)   # (n,)
+        # features: (15, n)
+        dS = ((S[:, None] - S_centers[None, :]) / 20.0) ** 2   # (n,5)
+        dv = ((v[:, None] - v_centers[None, :]) / 0.02) ** 2   # (n,3)
+        # outer product across S×v grid → (n, 15)
+        rbf = np.exp(-0.5 * (dS[:, :, None] + dv[:, None, :])).reshape(len(S), 15)
+        result = rbf @ weights   # (n,)
+        return float(result[0]) if scalar else result
     
-    #SVI-based drift (for SVI method)
+    #SVI-based drift (for SVI method) 
     def drift_lambda_svi(self, t, S, v, svi_params):
+        """S, v : scalars or (n_paths,) arrays."""
         if svi_params is None or len(svi_params) == 0:
             return 0.0
-        
         a, b, rho_svi, m, sigma_svi = svi_params
-        k = np.log(S / self.heston.S0)
+        k = np.log(np.asarray(S, dtype=float) / self.heston.S0)
         drift = a + b * (rho_svi * (k - m) + np.sqrt((k - m)**2 + sigma_svi**2))
-        return drift * np.sqrt(v / self.heston.theta)
+        return drift * np.sqrt(np.asarray(v, dtype=float) / self.heston.theta)
     
     #Worker function for parallel path simulation
     def _simulate_single_path_batch(self, args):
@@ -202,23 +206,15 @@ class HestonWithDrift:
             v_current = np.maximum(v[:, i], 1e-8)
             
             if weights is not None:
-                if is_svi:
-                    lambda_drift = np.array([
-                        self.drift_lambda_svi(t_curr, S[j, i], v_current[j], weights) 
-                        for j in range(n_paths_chunk)
-                    ])
-                else:
-                    lambda_drift = np.array([
-                        self.drift_lambda_rbf(t_curr, S[j, i], v_current[j], weights) 
-                        for j in range(n_paths_chunk)
-                    ])
+                fn = self.drift_lambda_svi if is_svi else self.drift_lambda_rbf
+                lambda_drift = fn(t_curr, S[:, i], v_current, weights)
             else:
                 lambda_drift = 0.0
-            
+
             drift_v = self.heston.kappa * (self.heston.theta - v_current) + lambda_drift
             dv = drift_v * dt + self.heston.sigma * np.sqrt(v_current) * dZ
             v[:, i + 1] = np.maximum(v_current + dv, 1e-8)
-            
+
             dS = S[:, i] * np.sqrt(v_current) * dW
             S[:, i + 1] = S[:, i] + dS
         
@@ -246,16 +242,8 @@ class HestonWithDrift:
                 v_current = np.maximum(v[:, i], 1e-8)
                 
                 if weights is not None:
-                    if is_svi:
-                        lambda_drift = np.array([
-                            self.drift_lambda_svi(t_curr, S[j, i], v_current[j], weights) 
-                            for j in range(n_paths)
-                        ])
-                    else:
-                        lambda_drift = np.array([
-                            self.drift_lambda_rbf(t_curr, S[j, i], v_current[j], weights) 
-                            for j in range(n_paths)
-                        ])
+                    fn = self.drift_lambda_svi if is_svi else self.drift_lambda_rbf
+                    lambda_drift = fn(t_curr, S[:, i], v_current, weights)
                 else:
                     lambda_drift = 0.0
                 
@@ -279,8 +267,12 @@ class HestonWithDrift:
             for i, size in enumerate(job_sizes) if size > 0
         ]
         
-        with Pool(n_jobs) as pool:
-            results = pool.map(self._simulate_single_path_batch, args_list)
+        if _HAS_JOBLIB:
+            results = Parallel(n_jobs=n_jobs, prefer='threads')(
+                jdelayed(self._simulate_single_path_batch)(a) for a in args_list)
+        else:
+            with Pool(n_jobs) as pool:
+                results = pool.map(self._simulate_single_path_batch, args_list)
         
         #Combine results
         S_T = np.concatenate(results)
@@ -295,17 +287,13 @@ class HestonWithDrift:
         
         return S_full, v_full, times
     
-    #Price calls with drift
+    #Price calls with drift — vectorised over strikes
     def price_calls(self, strikes, T, n_paths=5000, weights=None, is_svi=False, n_jobs=-1):
         S, _, _ = self.simulate_paths(T, 100, n_paths, weights, is_svi, n_jobs=n_jobs)
-        S_T = S[:, -1]
-        
-        prices = []
-        for K in strikes:
-            payoff = np.maximum(S_T - K, 0)
-            prices.append(np.mean(payoff))
-        
-        return np.array(prices)
+        S_T = S[:, -1]                              # (n_paths,)
+        strikes_arr = np.asarray(strikes)           # (K,)
+        payoffs = np.maximum(S_T[None, :] - strikes_arr[:, None], 0)  # (K, n_paths)
+        return payoffs.mean(axis=1)
 
 #Particle Filter
 
@@ -333,19 +321,18 @@ class ParticleFilterCalibration:
         )[0]
         return norm.pdf(market_price, loc=model_price, scale=0.3)
     
-    #Prepare arguments for parallel computation
+    #Parallel reweighting via joblib threads
     def reweight(self, market_price, strike, T, noise_std=0.3):
-        args_list = [
-            (i, self.particles[i], market_price, strike, T) 
-            for i in range(self.n_particles)
-        ]
-        
-        #Parallel likelihood computation
-        with Pool(min(N_CPUS, self.n_particles)) as pool:
-            likelihoods = pool.map(self._compute_likelihood, args_list)
-        
-        likelihoods = np.array(likelihoods)
-        
+        if _HAS_JOBLIB:
+            likelihoods = np.array(
+                Parallel(n_jobs=-1, prefer='threads')(
+                    jdelayed(self._compute_likelihood)(
+                        (i, self.particles[i], market_price, strike, T))
+                    for i in range(self.n_particles)))
+        else:
+            likelihoods = np.array([
+                self._compute_likelihood((i, self.particles[i], market_price, strike, T))
+                for i in range(self.n_particles)])
         self.weights *= likelihoods
         self.weights /= (np.sum(self.weights) + 1e-10)
     
@@ -546,45 +533,35 @@ class SVICalibration:
         self.svi_params = result.x
         return self.svi_params
 
-
-#MSB using potential optimization only
 class MSBCalibration:
     def __init__(self, heston_model):
-        self.heston = heston_model
-    
-    def potential(self, S, weights, strikes):
-        f = np.zeros_like(S)
-        for i, K in enumerate(strikes):
-            f += weights[i] * np.maximum(S - K, 0)
-        return np.clip(f, -50, 50)
-    
-    def objective(self, weights, strikes, market_prices, T):
-        market_term = np.sum(weights * market_prices)
-        
-        S, _, _ = self.heston.simulate_paths(T=T, n_steps=30, n_paths=1000)
-        S_T = S[:, -1]
-        
-        f_vals = self.potential(S_T, weights, strikes)
-        u_value = -np.log(np.mean(np.exp(-f_vals)) + 1e-10)
-        
-        regularization = 0.1 * np.sum(weights**2)
-        
-        return -(market_term - u_value) + regularization
-    
-    #Optimize Schrödinger potential
+        self.heston  = heston_model
+        self.msb     = MartingaleSchrodingerBridge(heston_model)
+        self._strikes = None
+        self._T       = None
+
     def calibrate(self, strikes, market_prices, T):
-        n_strikes = len(strikes)
-        bounds = [(-3, 3) for _ in range(n_strikes)]
-        
-        result = minimize(
-            lambda w: self.objective(w, strikes, market_prices, T),
-            x0=np.zeros(n_strikes),
-            method='L-BFGS-B',
-            bounds=bounds,
-            options={'maxiter': 30}
+        """Run real MSB training (reduced iterations for comparison speed)."""
+        self._strikes = strikes
+        self._T       = T
+        self.msb.train(
+            strikes=strikes,
+            market_prices=market_prices,
+            T=T,
+            n_iterations=300,  
+            batch_size=128,
+            lr=5e-4,
+            patience=60,
         )
-        
-        return result.x
+        return np.zeros(len(strikes))  
+
+    def price_calls(self, strikes, T, **kwargs):
+        """Price calls using the calibrated MSB model."""
+        prices = []
+        for K in strikes:
+            price, _ = self.msb.price_option(K, T, n_paths=5000)
+            prices.append(price)
+        return np.array(prices)
 
 #Results
 
@@ -663,179 +640,110 @@ def run_comparison(data: Dict) -> List[MethodResults]:
     X1_test = X1[test_idx, -d1:]
     X2_test = X2[test_idx]
    
+    #  Shared Brenier map (fitted once, reused by all methods) ─
+    print("Fitting shared Brenier map (used by all methods)...")
+    _brenier_start = time.time()
+    shared_brenier = ConditionalBrenierEstimator(d1=d1, d2=2, t=0.02, epsilon=0.004)
+    shared_brenier.fit(X1[:, -d1:], X2)
+    shared_brenier_time = time.time() - _brenier_start
+    shared_predictions = shared_brenier.predict(X1_test)
+    shared_w2 = shared_brenier.compute_wasserstein_error(X1_test, X2_test)
+    print(f"  Brenier fit: {shared_brenier_time:.1f}s, W2={shared_w2:.6f}")
+
+    def _brenier_stats():
+        mse_r = float(np.mean((shared_predictions[:, 0] - X2_test[:, 0])**2))
+        mse_v = float(np.mean((shared_predictions[:, 1] - X2_test[:, 1])**2))
+        return shared_brenier_time, mse_r, mse_v, float(shared_w2)
+
     print("Method 1: Particle Filter")
-    
+
     start = time.time()
     pf = ParticleFilterCalibration(heston_model, n_particles=100, n_weights=15)
     pf_weights = pf.calibrate(strikes, market_prices, T)
     pf_time = time.time() - start
-    
+
     pf_model_prices = pf.heston_drift.price_calls(
-        strikes, T, n_paths=5000, weights=pf_weights, n_jobs=N_CPUS
-    )
-    
-    pf_mae = np.mean(np.abs(pf_model_prices - market_prices))
-    pf_rmse = np.sqrt(np.mean((pf_model_prices - market_prices)**2))
-    
+        strikes, T, n_paths=5000, weights=pf_weights, n_jobs=N_CPUS)
+
+    pf_mae  = float(np.mean(np.abs(pf_model_prices - market_prices)))
+    pf_rmse = float(np.sqrt(np.mean((pf_model_prices - market_prices)**2)))
     print(f"Calibration: {pf_time:.1f}s, MAE={pf_mae:.4f}, RMSE={pf_rmse:.4f}")
 
-    #Brenier prediction
-    start = time.time()
-    brenier_pf = ConditionalBrenierEstimator(d1=d1, d2=2, t=0.02, epsilon=0.004)
-    brenier_pf.fit(X1[:, -d1:], X2)
-    pf_brenier_time = time.time() - start
-    
-    pf_predictions = np.array([brenier_pf.predict(x1) for x1 in X1_test])
-    pf_mse_return = np.mean((pf_predictions[:, 0] - X2_test[:, 0])**2)
-    pf_mse_vol = np.mean((pf_predictions[:, 1] - X2_test[:, 1])**2)
-    pf_w2 = brenier_pf.compute_wasserstein_error(X1_test, X2_test)
-    
-    print(f"Prediction: {pf_brenier_time:.1f}s, Return MSE={pf_mse_return:.6f}, W2={pf_w2:.6f}")
-    
+    pf_bt, pf_mse_r, pf_mse_v, pf_w2 = _brenier_stats()
+    print(f"Prediction (shared Brenier): Return MSE={pf_mse_r:.6f}, W2={pf_w2:.6f}")
+
     results.append(MethodResults(
-        name="Particle Filter",
-        drift_weights=pf_weights,
-        model_prices=pf_model_prices,
-        calibration_time=pf_time,
-        mae=pf_mae,
-        rmse=pf_rmse,
-        brenier_time=pf_brenier_time,
-        prediction_mse_return=pf_mse_return,
-        prediction_mse_vol=pf_mse_vol,
-        w2_error=pf_w2
-    ))
-    
+        name="Particle Filter", drift_weights=pf_weights,
+        model_prices=pf_model_prices, calibration_time=pf_time,
+        mae=pf_mae, rmse=pf_rmse, brenier_time=pf_bt,
+        prediction_mse_return=pf_mse_r, prediction_mse_vol=pf_mse_v, w2_error=pf_w2))
+
     print("Method 2: Gaussian Process")
-    
+
     start = time.time()
     gp = GaussianProcessCalibration(heston_model, n_weights=15, n_initial=20, n_iterations=50)
     gp_weights = gp.calibrate(strikes, market_prices, T)
     gp_time = time.time() - start
-    
+
     gp_model_prices = gp.heston_drift.price_calls(
-        strikes, T, n_paths=5000, weights=gp_weights, n_jobs=N_CPUS
-    )
-    
-    gp_mae = np.mean(np.abs(gp_model_prices - market_prices))
-    gp_rmse = np.sqrt(np.mean((gp_model_prices - market_prices)**2))
-    
+        strikes, T, n_paths=5000, weights=gp_weights, n_jobs=N_CPUS)
+
+    gp_mae  = float(np.mean(np.abs(gp_model_prices - market_prices)))
+    gp_rmse = float(np.sqrt(np.mean((gp_model_prices - market_prices)**2)))
     print(f"Calibration: {gp_time:.1f}s, MAE={gp_mae:.4f}, RMSE={gp_rmse:.4f}")
-    
-    # Brenier prediction
-    start = time.time()
-    brenier_gp = ConditionalBrenierEstimator(d1=d1, d2=2, t=0.02, epsilon=0.004)
-    brenier_gp.fit(X1[:, -d1:], X2)
-    gp_brenier_time = time.time() - start
-    
-    gp_predictions = np.array([brenier_gp.predict(x1) for x1 in X1_test])
-    gp_mse_return = np.mean((gp_predictions[:, 0] - X2_test[:, 0])**2)
-    gp_mse_vol = np.mean((gp_predictions[:, 1] - X2_test[:, 1])**2)
-    gp_w2 = brenier_gp.compute_wasserstein_error(X1_test, X2_test)
-    
-    print(f"Prediction: {gp_brenier_time:.1f}s, Return MSE={gp_mse_return:.6f}, W2={gp_w2:.6f}")
-    
+
+    gp_bt, gp_mse_r, gp_mse_v, gp_w2 = _brenier_stats()
+    print(f"Prediction (shared Brenier): Return MSE={gp_mse_r:.6f}, W2={gp_w2:.6f}")
+
     results.append(MethodResults(
-        name="GP Bayesian Opt",
-        drift_weights=gp_weights,
-        model_prices=gp_model_prices,
-        calibration_time=gp_time,
-        mae=gp_mae,
-        rmse=gp_rmse,
-        brenier_time=gp_brenier_time,
-        prediction_mse_return=gp_mse_return,
-        prediction_mse_vol=gp_mse_vol,
-        w2_error=gp_w2
-    ))
-    
+        name="GP Bayesian Opt", drift_weights=gp_weights,
+        model_prices=gp_model_prices, calibration_time=gp_time,
+        mae=gp_mae, rmse=gp_rmse, brenier_time=gp_bt,
+        prediction_mse_return=gp_mse_r, prediction_mse_vol=gp_mse_v, w2_error=gp_w2))
+
     print("Method 3: SVI")
-    
+
     start = time.time()
     svi = SVICalibration(heston_model)
     svi_params = svi.calibrate(strikes, market_prices, T)
     svi_time = time.time() - start
-    
-    svi_model_prices = svi.heston_drift.price_calls(
-        strikes, T, n_paths=5000, weights=svi_params, is_svi=True, n_jobs=N_CPUS
-    )
-    
-    svi_mae = np.mean(np.abs(svi_model_prices - market_prices))
-    svi_rmse = np.sqrt(np.mean((svi_model_prices - market_prices)**2))
-    
-    print(f"Calibration: {svi_time:.1f}s, MAE={svi_mae:.4f}, RMSE={svi_rmse:.4f}")
-    
-    #Brenier prediction
-    start = time.time()
-    brenier_svi = ConditionalBrenierEstimator(d1=d1, d2=2, t=0.02, epsilon=0.004)
-    brenier_svi.fit(X1[:, -d1:], X2)
-    svi_brenier_time = time.time() - start
-    
-    svi_predictions = np.array([brenier_svi.predict(x1) for x1 in X1_test])
-    svi_mse_return = np.mean((svi_predictions[:, 0] - X2_test[:, 0])**2)
-    svi_mse_vol = np.mean((svi_predictions[:, 1] - X2_test[:, 1])**2)
-    svi_w2 = brenier_svi.compute_wasserstein_error(X1_test, X2_test)
-    
-    print(f"Prediction: {svi_brenier_time:.1f}s, Return MSE={svi_mse_return:.6f}, W2={svi_w2:.6f}")
-    
-    results.append(MethodResults(
-        name="SVI",
-        drift_weights=svi_params,
-        model_prices=svi_model_prices,
-        calibration_time=svi_time,
-        mae=svi_mae,
-        rmse=svi_rmse,
-        brenier_time=svi_brenier_time,
-        prediction_mse_return=svi_mse_return,
-        prediction_mse_vol=svi_mse_vol,
-        w2_error=svi_w2
-    ))
-    
-    #Methof 4: MSB
 
-    print("Method 4: Martingale Schodinger Bridge")
-    
+    svi_model_prices = svi.heston_drift.price_calls(
+        strikes, T, n_paths=5000, weights=svi_params, is_svi=True, n_jobs=N_CPUS)
+
+    svi_mae  = float(np.mean(np.abs(svi_model_prices - market_prices)))
+    svi_rmse = float(np.sqrt(np.mean((svi_model_prices - market_prices)**2)))
+    print(f"Calibration: {svi_time:.1f}s, MAE={svi_mae:.4f}, RMSE={svi_rmse:.4f}")
+
+    svi_bt, svi_mse_r, svi_mse_v, svi_w2 = _brenier_stats()
+    print(f"Prediction (shared Brenier): Return MSE={svi_mse_r:.6f}, W2={svi_w2:.6f}")
+
+    results.append(MethodResults(
+        name="SVI", drift_weights=svi_params,
+        model_prices=svi_model_prices, calibration_time=svi_time,
+        mae=svi_mae, rmse=svi_rmse, brenier_time=svi_bt,
+        prediction_mse_return=svi_mse_r, prediction_mse_vol=svi_mse_v, w2_error=svi_w2))
+
+    print("Method 4: Martingale Schrödinger Bridge")
+
     start = time.time()
     msb = MSBCalibration(heston_model)
     msb_weights = msb.calibrate(strikes, market_prices, T)
     msb_time = time.time() - start
 
-    S, _, _ = heston_model.simulate_paths(T=T, n_steps=100, n_paths=5000)
-    S_T = S[:, -1]
-    msb_model_prices = []
-    for K in strikes:
-        payoff = np.maximum(S_T - K, 0)
-        msb_model_prices.append(np.mean(payoff))
-    msb_model_prices = np.array(msb_model_prices)
-    
-    msb_mae = np.mean(np.abs(msb_model_prices - market_prices))
-    msb_rmse = np.sqrt(np.mean((msb_model_prices - market_prices)**2))
-    
+    msb_model_prices = msb.price_calls(strikes, T, n_paths=5000)
+    msb_mae  = float(np.mean(np.abs(msb_model_prices - market_prices)))
+    msb_rmse = float(np.sqrt(np.mean((msb_model_prices - market_prices)**2)))
     print(f"Calibration: {msb_time:.1f}s, MAE={msb_mae:.4f}, RMSE={msb_rmse:.4f}")
-    
-    #Brenier prediction
-    start = time.time()
-    brenier_msb = ConditionalBrenierEstimator(d1=d1, d2=2, t=0.02, epsilon=0.004)
-    brenier_msb.fit(X1[:, -d1:], X2)
-    msb_brenier_time = time.time() - start
-    
-    msb_predictions = np.array([brenier_msb.predict(x1) for x1 in X1_test])
-    msb_mse_return = np.mean((msb_predictions[:, 0] - X2_test[:, 0])**2)
-    msb_mse_vol = np.mean((msb_predictions[:, 1] - X2_test[:, 1])**2)
-    msb_w2 = brenier_msb.compute_wasserstein_error(X1_test, X2_test)
-    
-    print(f"Prediction: {msb_brenier_time:.1f}s, Return MSE={msb_mse_return:.6f}, W2={msb_w2:.6f}")
-    
+
+    msb_bt, msb_mse_r, msb_mse_v, msb_w2 = _brenier_stats()
+    print(f"Prediction (shared Brenier): Return MSE={msb_mse_r:.6f}, W2={msb_w2:.6f}")
+
     results.append(MethodResults(
-        name="MSB",
-        drift_weights=msb_weights,
-        model_prices=msb_model_prices,
-        calibration_time=msb_time,
-        mae=msb_mae,
-        rmse=msb_rmse,
-        brenier_time=msb_brenier_time,
-        prediction_mse_return=msb_mse_return,
-        prediction_mse_vol=msb_mse_vol,
-        w2_error=msb_w2
-    ))
+        name="MSB", drift_weights=msb_weights,
+        model_prices=msb_model_prices, calibration_time=msb_time,
+        mae=msb_mae, rmse=msb_rmse, brenier_time=msb_bt,
+        prediction_mse_return=msb_mse_r, prediction_mse_vol=msb_mse_v, w2_error=msb_w2))
     
     return results
 

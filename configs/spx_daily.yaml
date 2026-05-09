@@ -1,0 +1,47 @@
+# Parameters for daily SPX real-data calibration pipeline
+
+data:
+  source: yfinance          # 'yfinance' | 'cboe_csv' | 'ibkr'
+  cboe_csv_path: null       # path to CBOE CSV if source='cboe_csv'
+  history_start: "2020-01-01"
+  min_dte: 7
+  max_dte: 400
+
+filters:
+  max_spread_pct: 0.15   # (ask - bid) / mid
+  min_bid: 0.05
+  min_volume: 10
+  min_open_interest: 100
+  min_moneyness: 0.75
+  max_moneyness: 1.30
+  min_iv: 0.03
+  max_iv: 2.00
+  prefer_option_type: otm   # 'otm' | 'call' | 'put'
+
+surface:
+  moneyness_grid:
+    start: 0.80
+    stop: 1.20
+    n: 21
+  maturities: [0.25, 0.50, 0.75, 1.00]
+  interpolate_missing: true
+
+arbitrage:
+  run_static: true
+  run_calendar: true
+  run_pcp: true
+  iv_gap_threshold: 0.02
+
+prediction:
+  lookback: 20
+  horizon:  5
+
+calibration:
+  methods: [particle_filter, gp, svi, msb]
+  maturity_idx: 3          # which maturity to calibrate against (0-indexed)
+  n_paths: 20000      # MC paths for repricing
+
+output:
+  filename: unified_real_spx_data.npz
+  data_dir: data/processed/prediction
+  run_plots: true

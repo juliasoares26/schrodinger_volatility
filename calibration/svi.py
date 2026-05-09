@@ -9,12 +9,23 @@ import sys
 from multiprocessing import Pool, cpu_count
 from functools import partial
 
-# Import HestonModel
-sys.path.append(str(Path(__file__).parent.parent / 'models'))
-from heston import HestonUnified
+try:
+    from numba import njit, prange
+    _NUMBA = True
+except ImportError:
+    _NUMBA = False
 
+from pathlib import Path
+import sys
+ 
+_calibration_dir = Path(__file__).parent.parent / 'calibration'
+if str(_calibration_dir) not in sys.path:
+    sys.path.insert(0, str(_calibration_dir))
+ 
+from base import HestonUnified  # noqa: F401  (re-export)
 
-#Search for data file in multiple possible locations
+__all__ = ['HestonUnified']
+
 def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3):
     script_dir = Path(__file__).parent.absolute()
     
@@ -33,7 +44,7 @@ def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3
             print(f"Found: {path}")
             return path
     
-    #Recursive search
+    # Recursive search
     for path in [script_dir, Path.cwd()]:
         for depth in range(search_depth + 1):
             pattern = '/'.join(['*'] * depth) + f'/{filename}'
@@ -45,19 +56,19 @@ def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3
     print(f"File not found!")
     return None
 
-#Conditional Brenier Map Estimator 
+# Conditional Brenier Map Estimator 
 
-#Entropic Optimal Transport for conditional price prediction
-#Implements rescaled quadratic cost approach from Baptista et al. (2024):
-#Cost: c_t(x,y) = ½‖A_t(x-y)‖² where A_t = diag(1_d₁, √t·1_d₂)
-#Sinkhorn algorithm for entropic regularization
-#Barycentric projection for conditional mean prediction
-#With t ∝ n^(-1/3) and ε ∝ t², achieves O(n^(-2/3)) rate
+# Entropic Optimal Transport for conditional price prediction
+# Implements rescaled quadratic cost approach from Baptista et al. (2024):
+# Cost: c_t(x,y) = ½‖A_t(x-y)‖² where A_t = diag(1_d₁, √t·1_d₂)
+# Sinkhorn algorithm for entropic regularization
+# Barycentric projection for conditional mean prediction
+# With t ∝ n^(-1/3) and ε ∝ t², achieves O(n^(-2/3)) rate
 
 class ConditionalBrenierEstimator:
-#Parameters - d1: int - Dimension of conditioning variables
-#d2: int - Dimension of target variables
-#t : float - Rescaling parameter - t ∝ n^(-1/3))
+# Parameters - d1: int - Dimension of conditioning variables
+# d2: int - Dimension of target variables
+# t: float - Rescaling parameter - t ∝ n^(-1/3))
 #epsilon : float - Entropic regularization -  ε ∝ t²
     def __init__(self, d1: int, d2: int, t: float = 0.01, epsilon: float = 0.001):
         self.d1 = d1
@@ -85,129 +96,92 @@ class ConditionalBrenierEstimator:
         return C
     
      
-    #Sinkhorn algorithm for entropic OT dual potentials.
-    #Solves: min_π <C,π> + ε·KL(π‖ρ⊗μ)
-    #Returns dual potential g satisfying:
-    #π_ij ∝ exp((f_i + g_j - C_ij)/ε)
+    # Sinkhorn algorithm for entropic OT dual potentials
+    # Solves: min_π <C,π> + ε·KL(π‖ρ⊗μ)
+    # Returns dual potential g satisfying:
+    # π_ij ∝ exp((f_i + g_j - C_ij)/ε)
     
     def sinkhorn_dual_potentials(self, C, max_iter=1000, tol=1e-6):
+        from scipy.special import logsumexp
+
         n, m = C.shape
-        
         f = np.zeros(n)
         g = np.zeros(m)
-        
-        for iteration in range(max_iter):
-            f_old = f.copy()
-            
-            #Update f
-            f = -self.epsilon * np.log(
-                np.sum(np.exp((g - C.T) / self.epsilon), axis=1) + 1e-10
-            )
-            
-            #Update g
-            g = -self.epsilon * np.log(
-                np.sum(np.exp((f[:, np.newaxis] - C) / self.epsilon), axis=0) + 1e-10
-            )
-            
-            #Convergence check
-            if np.max(np.abs(f - f_old)) < tol:
+        eps = self.epsilon
+
+        C_T = C.T.copy()   # (m, n) — layout contíguo para LSE sobre eixo 1
+
+        for _ in range(max_iter):
+            # f_i = -ε · log Σ_j exp((g_j - C_ij)/ε)
+            f_new = -eps * logsumexp((g[np.newaxis, :] - C) / eps, axis=1)
+
+            # g_j = -ε · log Σ_i exp((f_i - C_ij)/ε)
+            g = -eps * logsumexp((f_new[:, np.newaxis] - C) / eps, axis=0)
+
+            if np.max(np.abs(f_new - f)) < tol:
+                f = f_new
                 break
-        
+            f = f_new
+
         return g
-    
-     
-    #Fit conditional Brenier map to joint samples (X₁, X₂).
-    #X1: ndarray, shape (n, d1) - Conditioning variables (past features)
-    #X2: ndarray, shape (n, d2) - Target variables (future outcomes)
+
     def fit(self, X1, X2):
         print(f"\n Fitting Conditional Brenier Map")
         print(f"d1={self.d1}, d2={self.d2}, t={self.t:.4f}, ε={self.epsilon:.4f}")
-        
+
         n = X1.shape[0]
-        
-        #Store training data
         self.X_train = np.hstack([X1, X2])
         self.Y_train = np.hstack([X1, X2])
-        
-        #Compute rescaled cost
+
         C = self.compute_rescaled_cost(self.X_train, self.Y_train)
-        
-        #Solve Sinkhorn
+
         start = time.time()
         self.dual_potentials = self.sinkhorn_dual_potentials(C)
         sinkhorn_time = time.time() - start
-        
+
         print(f"Fitted on {n} samples ({sinkhorn_time:.1f}s)")
-    
-      #Predict X₂ given X₁ = x1_query via entropic Brenier map.
-      #T̂_ε,t(x) = Σᵢ Yᵢ · wᵢ(x)
-      #where wᵢ(x) ∝ exp((gᵢ - ½‖A_t(x-Yᵢ)‖²)/ε)
-      #x1_query : ndarray, shape (d1,) or (n_query, d1)
-      #prediction : ndarray, shape (d2,) or (n_query, d2)
-      #Predicted target (conditional mean E[X₂|X₁])
 
     def predict(self, x1_query, return_distribution=False, n_samples=1000):
         x1_query = np.atleast_2d(x1_query)
-        
+        Q = x1_query.shape[0]
+
         if self.dual_potentials is None:
             raise ValueError("Model not fitted, call fit() first.")
-        
-        #Extend query to full dimension
-        x_extended = np.zeros((x1_query.shape[0], self.d1 + self.d2))
-        x_extended[:, :self.d1] = x1_query
-        
-        predictions = []
-        all_samples = [] if return_distribution else None
-        
-        for x in x_extended:
-            #Compute barycentric weights
-            x_scaled = self.A_t @ x
-            Y_scaled = self.Y_train @ self.A_t.T
-            
-            distances = np.sum((Y_scaled - x_scaled) ** 2, axis=1) / 2.0
-            
-            #Weights
-            log_weights = (self.dual_potentials - distances) / self.epsilon
-            log_weights -= np.max(log_weights)
-            weights = np.exp(log_weights)
-            weights /= np.sum(weights)
-            
-            #Barycentric projection (conditional mean)
-            result = np.sum(self.Y_train * weights[:, np.newaxis], axis=0)
-            predictions.append(result[self.d1:])
-            
-            #Sample from weighted distribution if requested
-            if return_distribution:
-                indices = np.random.choice(
-                    len(self.Y_train), 
-                    size=n_samples, 
-                    p=weights,
-                    replace=True
-                )
-                samples = self.Y_train[indices, self.d1:]
-                all_samples.append(samples)
-        
-        prediction = np.array(predictions).squeeze()
-        
-        if return_distribution:
-            return prediction, all_samples[0] if len(all_samples) == 1 else all_samples
-        
-        return prediction
-    
-    #Compute Wasserstein-2 distance between true and predicted conditionals
-    def compute_wasserstein_error(self, x1_test, x2_test):
-        predictions = []
-        for x1 in x1_test:
-            pred = self.predict(x1)
-            predictions.append(pred)
-        
-        predictions = np.array(predictions)
-        
-        # W₂² ≈ MSE for Gaussians (approximation)
-        mse = np.mean((predictions - x2_test) ** 2)
-        return np.sqrt(mse)
 
-#Compute Black-Scholes call option price
+        x_ext = np.zeros((Q, self.d1 + self.d2))
+        x_ext[:, :self.d1] = x1_query
+
+        x_scaled = x_ext @ self.A_t                   # (Q, d)
+        Y_scaled = self.Y_train @ self.A_t.T           # (n, d)
+        distances = cdist(x_scaled, Y_scaled, metric='sqeuclidean') / 2.0   # (Q, n)
+
+        lw = (self.dual_potentials[np.newaxis, :] - distances) / self.epsilon  # (Q, n)
+        lw -= lw.max(axis=1, keepdims=True)
+        weights = np.exp(lw)
+        weights /= weights.sum(axis=1, keepdims=True)   # (Q, n)
+
+        pred_full   = weights @ self.Y_train            # (Q, d1+d2)
+        predictions = pred_full[:, self.d1:]            # (Q, d2)
+
+        if not return_distribution:
+            return predictions.squeeze()
+
+        all_samples = []
+        for q in range(Q):
+            idx = np.random.choice(len(self.Y_train), size=n_samples,
+                                   p=weights[q], replace=True)
+            all_samples.append(self.Y_train[idx, self.d1:])
+
+        result = predictions.squeeze()
+        samples_out = all_samples[0] if Q == 1 else all_samples
+        return result, samples_out
+    
+    def compute_wasserstein_error(self, x1_test, x2_test):
+        predictions = self.predict(np.atleast_2d(x1_test))   # (Q, d2)
+        mse = np.mean((predictions - x2_test) ** 2)
+        return float(np.sqrt(mse))
+
+# Compute Black-Scholes call option price
 def black_scholes_price(S, K, T, sigma, r=0.0):
     
     if T <= 0 or sigma <= 0:
@@ -217,7 +191,7 @@ def black_scholes_price(S, K, T, sigma, r=0.0):
     d2 = d1 - sigma*np.sqrt(T)
     return S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
 
-#Compute implied volatility via Newton-Raphson
+# Compute implied volatility via Newton-Raphson
 def black_scholes_iv(S, K, T, price, r=0.0):
     if price <= max(S - K, 0):
         return 0.01
@@ -251,13 +225,13 @@ def load_unified_data(maturity_idx=3):
     
     data = np.load(data_file, allow_pickle=True)
     
-    #Volatility surface data
+    # Volatility surface data
     strikes_norm = data['strikes_norm']
     maturities = data['maturities']
     vol_surface = data['vol_surface']
     heston_params = data['heston_params'].item()
     
-    #Price prediction data
+    # Price prediction data
     X1_full = data['full_X1']
     X2_full = data['full_X2']
     X1_raw = data['full_X1_raw']
@@ -275,13 +249,13 @@ def load_unified_data(maturity_idx=3):
     print(f"Targets (X₂): {X2_full.shape[1]} (return, vol, drawdown)")
     print(f"Lookback: {lookback} days, Horizon: {horizon} days")
     
-    #Extract maturity for SVI calibration
+    # Extract maturity for SVI calibration
     S0 = float(heston_params['S0'])
     T = float(maturities[maturity_idx])
     market_vols = vol_surface[maturity_idx, :]
     strikes = strikes_norm * S0
     
-    #Compute prices from IVs
+    # Compute prices from IVs
     market_prices = np.array([
         S0*norm.cdf((np.log(S0/K) + 0.5*iv**2*T)/(iv*np.sqrt(T))) - 
         K*norm.cdf((np.log(S0/K) + 0.5*iv**2*T)/(iv*np.sqrt(T)) - iv*np.sqrt(T))
@@ -307,109 +281,64 @@ class HestonModelWithSVIDrift:
     def __init__(self, heston_model):
         self.heston = heston_model
 
-   #SVI-parametrized drift function
-    def drift_lambda(self, t, S, v, svi_params):
-        if svi_params is None or len(svi_params) == 0:
-            return 0.0
-        
+    # Vectorized SVI drift over all paths at once — shape (n_paths,)
+    def drift_lambda_vec(self, S_arr, v_arr, svi_params):
+        """Fully vectorized; S_arr and v_arr are 1-D arrays of length n_paths."""
+        if svi_params is None:
+            return np.zeros(len(S_arr))
         a, b, rho_svi, m, sigma_svi = svi_params
-        
-        k = np.log(S / self.heston.S0)
-        drift = a + b * (rho_svi * (k - m) + np.sqrt((k - m)**2 + sigma_svi**2))
-        
-        return drift * np.sqrt(v / self.heston.theta)
-    
-    #Simulate paths with SVI drift on variance
+        k = np.log(np.maximum(S_arr, 1e-8) / self.heston.S0)
+        drift = a + b * (rho_svi * (k - m) + np.sqrt((k - m) ** 2 + sigma_svi ** 2))
+        return drift * np.sqrt(np.maximum(v_arr, 1e-8) / self.heston.theta)
+
+    #Simulate paths with SVI drift on variance — vectorized, antithetic variates
     def simulate_paths_with_svi_drift(self, T, n_steps, n_paths, svi_params=None):
-        dt = T / n_steps
-        times = np.linspace(0, T, n_steps + 1)
-        
+        dt          = T / n_steps
+        sqrt_dt     = np.sqrt(dt)
+        sqrt_1mrho2 = np.sqrt(1.0 - self.heston.rho ** 2)
+        times       = np.linspace(0, T, n_steps + 1)
+
+        # Antithetic variates: mirror noise to halve MC variance
+        half = n_paths // 2
+        Z1_all = np.random.randn(n_steps, half)
+        Z2_all = np.random.randn(n_steps, half)
+        Z1f = np.concatenate([Z1_all, -Z1_all], axis=1)[:, :n_paths]
+        Z2f = np.concatenate([Z2_all, -Z2_all], axis=1)[:, :n_paths]
+
         S = np.zeros((n_paths, n_steps + 1))
         v = np.zeros((n_paths, n_steps + 1))
-        
         S[:, 0] = self.heston.S0
         v[:, 0] = self.heston.v0
-        
+
         for i in range(n_steps):
-            t_curr = times[i]
-            
-            Z1 = np.random.randn(n_paths)
-            Z2 = np.random.randn(n_paths)
-            
-            W1 = Z1
-            W2 = self.heston.rho * Z1 + np.sqrt(1 - self.heston.rho**2) * Z2
-            
+            dW = Z1f[i] * sqrt_dt
+            dZ = self.heston.rho * Z1f[i] * sqrt_dt + sqrt_1mrho2 * Z2f[i] * sqrt_dt
+
             v_curr = np.maximum(v[:, i], 1e-8)
-            
-            #SVI drift
-            if svi_params is not None:
-                lambda_drift = np.array([
-                    self.drift_lambda(t_curr, S[j, i], v_curr[j], svi_params) 
-                    for j in range(n_paths)
-                ])
-            else:
-                lambda_drift = 0.0
-            
-            #Variance with drift
+
+            # Vectorized drift — no Python loop over paths
+            lambda_drift = (self.drift_lambda_vec(S[:, i], v_curr, svi_params)
+                            if svi_params is not None else 0.0)
+
             drift_v = self.heston.kappa * (self.heston.theta - v_curr) + lambda_drift
-            dv = drift_v * dt + self.heston.sigma * np.sqrt(v_curr * dt) * W2
-            v[:, i + 1] = np.maximum(v_curr + dv, 1e-8)
-            
-            #Price (martingale)
+            v[:, i + 1] = np.maximum(
+                v_curr + drift_v * dt + self.heston.sigma * np.sqrt(v_curr) * dZ,
+                1e-8)
             S[:, i + 1] = S[:, i] * np.exp(
-                (self.heston.r - 0.5 * v_curr) * dt + np.sqrt(v_curr * dt) * W1
-            )
-        
+                (self.heston.r - 0.5 * v_curr) * dt + np.sqrt(v_curr) * dW)
+
         return S, v, times
     
-    #Worker function for parallel pricing
-    def _simulate_and_price_worker(self, n_paths_chunk, T, n_steps, strikes, svi_params):
-        S, _, _ = self.simulate_paths_with_svi_drift(
-            T, n_steps=n_steps, n_paths=n_paths_chunk, svi_params=svi_params
-        )
-        S_T = S[:, -1]
-        
-        #Compute payoffs for all strikes
-        payoffs = np.maximum(S_T[:, np.newaxis] - strikes[np.newaxis, :], 0)
-        return payoffs
-    
     def price_calls(self, strikes, T, n_paths=10000, svi_params=None, n_jobs=-1):
-        if n_jobs == -1:
-            n_jobs = cpu_count()
-        
-        if n_jobs == 1:
-            #Sequential fallback
-            S, _, _ = self.simulate_paths_with_svi_drift(
-                T, n_steps=100, n_paths=n_paths, svi_params=svi_params
-            )
-            S_T = S[:, -1]
-            prices = []
-            for K in strikes:
-                payoff = np.maximum(S_T - K, 0)
-                prices.append(np.exp(-self.heston.r * T) * np.mean(payoff))
-            return np.array(prices)
-        
-        #Split paths across workers
-        paths_per_job = n_paths // n_jobs
-        remaining = n_paths % n_jobs
-        
-        job_sizes = [paths_per_job + (1 if i < remaining else 0) 
-                     for i in range(n_jobs)]
-        
-        #Parallel simulation
-        simulate_partial = partial(
-            self._simulate_and_price_worker,
-            T=T, n_steps=100, strikes=strikes, svi_params=svi_params
+        # Always sequential — the vectorized simulate is already fast enough
+        # and avoids nested Pool / pickling errors on Windows.
+        S, _, _ = self.simulate_paths_with_svi_drift(
+            T, n_steps=100, n_paths=n_paths, svi_params=svi_params
         )
-        
-        with Pool(n_jobs) as pool:
-            results = pool.map(simulate_partial, job_sizes)
-        
-        #Aggregate results
-        all_payoffs = np.concatenate(results, axis=0)
-        prices = np.mean(all_payoffs, axis=0) * np.exp(-self.heston.r * T)
-        
-        return prices
+        S_T     = S[:, -1]
+        strikes = np.asarray(strikes)
+        payoffs = np.maximum(S_T[:, None] - strikes[None, :], 0)   # (n, n_strikes)
+        return np.exp(-self.heston.r * T) * payoffs.mean(axis=0)
 
 #Parametrizes drift as: λ(k) = a + b(ρ(k-m) + √((k-m)² + σ²))
 class SVIDriftCalibration:
@@ -425,123 +354,119 @@ class SVIDriftCalibration:
         
         print(f"\n Parallel mode: {self.n_jobs} CPUs")
     
-    def _objective_function(self, params):
-        try:
-            model_prices = self.heston_svi.price_calls(
-                self.strikes, self.T, n_paths=5000, 
-                svi_params=params, n_jobs=1  
-            )
-            loss = np.mean((model_prices - self.market_prices)**2)
-        except:
-            loss = 1e6
-        return loss
-   
+    
     #Calibrate SVI parameters to market prices.
     #Minimizes: Σ [C_model(K; θ) - C_market(K)]² where θ = (a, b, ρ, m, σ) are SVI parameters
     
     def calibrate(self, strikes, market_prices, T, verbose=True):
+        """
+        Fixes applied
+        -------------
+        * objective always calls price_calls with n_jobs=1 (no nested Pool)
+        * differential_evolution uses workers=1 for the same reason
+        * 5 warm-start attempts with diverse, well-chosen initial points
+        * tighter parameter bounds to avoid degenerate solutions
+        * fallback threshold lowered to 0.01
+        """
+        self.strikes       = strikes
+        self.market_prices = market_prices
+        self.T             = T
+
         if verbose:
             print(f"Strikes: {len(strikes)}")
             print(f"Maturity: T={T:.2f}Y")
-        
-        #Initial guess
-        initial_guess = [0.0, 0.1, -0.1, 0.0, 0.3]
-        
-        #Bounds
+
         bounds = [
             (-0.2, 0.2),   # a
-            (0.01, 1.0),   # b
+            (0.01, 0.8),   # b  (tighter — avoids degenerate large-b)
             (-0.9, 0.9),   # ρ
-            (-1.0, 1.0),   # m
-            (0.05, 2.0)    # σ
+            (-0.5, 0.5),   # m
+            (0.05, 1.0)    # σ  (tighter upper bound)
         ]
-        
-        def objective(params):
+
+        # Inner objective — always sequential to avoid nested Pool
+        def _obj(params):
             try:
-                model_prices = self.heston_svi.price_calls(
-                    strikes, T, n_paths=5000, svi_params=params, n_jobs=self.n_jobs
+                prices = self.heston_svi.price_calls(
+                    strikes, T, n_paths=3000, svi_params=params, n_jobs=1
                 )
-                loss = np.mean((model_prices - market_prices)**2)
-            except:
-                loss = 1e6
-            return loss
-        
-        #No-arbitrage constraints
-        def constraint1(params):
-            a, b, rho, m, sigma = params
-            return 4 - b * (1 + np.abs(rho))
-        
-        def constraint2(params):
-            a, b, rho, m, sigma = params
-            return a + b * sigma * np.sqrt(1 - rho**2) + 0.1
-        
+                return float(np.mean((prices - market_prices) ** 2))
+            except Exception:
+                return 1e6
+
         constraints = [
-            {'type': 'ineq', 'fun': constraint1},
-            {'type': 'ineq', 'fun': constraint2}
+            {'type': 'ineq', 'fun': lambda p: 4 - p[1] * (1 + abs(p[2]))},
+            {'type': 'ineq', 'fun': lambda p: p[0] + p[1] * p[4] * np.sqrt(1 - p[2]**2) + 0.01},
         ]
-        
+
         if verbose:
             print(f"\n Optimizing SVI parameters...")
-        
+
         start_time = time.time()
-        
-        #Multiple starts
+
+        # Warm-start grid: cover typical equity-skew parameter space
+        initial_candidates = [
+            [0.0,  0.10, -0.50,  0.0,  0.30],  # near-flat
+            [0.0,  0.20, -0.70,  0.0,  0.20],  # moderate skew
+            [-0.05, 0.15, -0.60, -0.1, 0.25],  # slight shift
+            [0.02, 0.08, -0.30,  0.1,  0.40],  # low-b
+            [0.0,  0.30, -0.80,  0.0,  0.15],  # strong skew
+        ]
+
         best_result = None
-        best_loss = np.inf
-        
-        for attempt in range(3):
-            if attempt == 0:
-                x0 = initial_guess
-            else:
-                x0 = [np.random.uniform(bounds[i][0], bounds[i][1]) 
-                      for i in range(len(bounds))]
-            
+        best_loss   = np.inf
+
+        for attempt, x0 in enumerate(initial_candidates):
             try:
-                result = minimize(
-                    objective, x0=x0, method='SLSQP',
+                res = minimize(
+                    _obj, x0=x0, method='SLSQP',
                     bounds=bounds, constraints=constraints,
-                    options={'maxiter': 150, 'ftol': 1e-6}
+                    options={'maxiter': 200, 'ftol': 1e-7}
                 )
-                
-                if result.fun < best_loss:
-                    best_loss = result.fun
-                    best_result = result
-                
-                if result.success and verbose:
-                    print(f"Attempt {attempt + 1}: Success (loss={result.fun:.6f})")
+                if res.fun < best_loss:
+                    best_loss   = res.fun
+                    best_result = res
+                if verbose:
+                    print(f"  Attempt {attempt+1}: loss={res.fun:.6f} "
+                          f"({'ok' if res.success else 'no conv'})")
+                if best_loss < 1e-4:   # good enough — stop early
                     break
             except Exception as e:
                 if verbose:
-                    print(f"Attempt {attempt + 1}: {e}")
-        
-        result = best_result if best_result is not None else result
-        
-        #Fallback to global optimization
-        if not result.success or result.fun > 0.1:
+                    print(f"  Attempt {attempt+1}: exception ({e})")
+
+        # Fallback to global search only if local search failed noticeably
+        if best_result is None or best_loss > 0.01:
             if verbose:
-                print(f"Trying Differential Evolution (parallel)...")
-            
-            result = differential_evolution(self._objective_function, bounds=bounds, maxiter=100, seed=42, workers=1, polish=True)
-        
+                print("  Trying Differential Evolution (global, sequential)...")
+            de_res = differential_evolution(
+                _obj, bounds=bounds,
+                maxiter=150, seed=42,
+                workers=1,    # no nested Pool
+                polish=True,
+                tol=1e-7,
+            )
+            if de_res.fun < best_loss:
+                best_result = de_res
+                best_loss   = de_res.fun
+
         calib_time = time.time() - start_time
-        
-        self.svi_params = result.x
-        
+        self.svi_params = best_result.x
+
         if verbose:
             a, b, rho, m, sigma = self.svi_params
             print(f"\n Calibration complete ({calib_time:.1f}s)")
-            print(f"Loss (MSE): {result.fun:.6f}")
-            print(f"Parameters: a={a:.4f}, b={b:.4f}, ρ={rho:.4f}, m={m:.4f}, σ={sigma:.4f}")
-        
+            print(f"  Loss (MSE): {best_loss:.6f}")
+            print(f"  a={a:.4f}, b={b:.4f}, ρ={rho:.4f}, m={m:.4f}, σ={sigma:.4f}")
+
         return self.svi_params
     
-    #Reprice options with calibrated SVI drift
+    # Reprice options with calibrated SVI drift
     def reprice(self, strikes, T):
         if self.svi_params is None:
             raise ValueError("Must calibrate first")
-        
         return self.heston_svi.price_calls(
-            strikes, T, n_paths=20000, svi_params=self.svi_params, n_jobs=self.n_jobs
+            strikes, T, n_paths=20000, svi_params=self.svi_params
         )
 
 
@@ -613,7 +538,7 @@ if __name__ == "__main__":
     X2 = data['X2']
     X1_raw = data['X1_raw']
     
-    print(f"  Market Data:")
+    print(f"Market Data:")
     print(f"Strikes: {len(strikes)} options at T={T:.2f}Y")
     print(f"Price range: [{market_prices.min():.4f}, {market_prices.max():.4f}]")
     print(f"\n Prediction Data:")
@@ -621,25 +546,30 @@ if __name__ == "__main__":
     print(f"Features: {X1.shape[1]}")
     print(f"Targets: {X2.shape[1]} (return, vol, drawdown)")
     
-    #Initialize hybrid method with parallelization
+    # Initialize hybrid method with parallelization
     heston_model = HestonUnified(**heston_params)
     n_cpus = cpu_count()
     print(f"\n Available CPUs: {n_cpus}")
     hybrid = HybridSVIBrenierMethod(heston_model, n_jobs=n_cpus)
     
-    #SVI Calibration
+    # SVI Calibration
     svi_params, svi_time = hybrid.calibrate_svi_drift(strikes, market_prices, T)
     
-    #Brenier Map
+    # Brenier Map
     d1 = 7  #Use last 7 features
-    brenier, brenier_time = hybrid.fit_brenier_map(X1, X2, d1=d1, t=0.02, epsilon=0.004)
+    # t and epsilon auto-tuned: t* = 0.1*n^(-1/3), epsilon* = t*^2
+    n_train  = len(X1)
+    t_auto   = 0.1 * (n_train ** (-1/3))
+    eps_auto = t_auto ** 2
+    print(f"  Brenier auto-params: t={t_auto:.4f}  ε={eps_auto:.6f}")
+    brenier, brenier_time = hybrid.fit_brenier_map(X1, X2, d1=d1, t=t_auto, epsilon=eps_auto)
 
     print("Calibration Times")
     print(f"SVI calibration: {svi_time:.1f}s")
     print(f"Brenier fitting: {brenier_time:.1f}s")
     print(f"Total: {svi_time + brenier_time:.1f}s")
     
-    #Validation 1: SVI drift accuracy
+    # Validation 1: SVI drift accuracy
     model_prices = hybrid.svi_calibrator.reprice(strikes, T)
     
     errors = np.abs(model_prices - market_prices)
@@ -649,19 +579,15 @@ if __name__ == "__main__":
     print(f"MAE: {mae:.4f}")
     print(f"RMSE: {rmse:.4f}")
     
-    #Validation 2: Price prediction accuracy
+    # Validation 2: Price prediction accuracy
     n_test = min(500, len(X1))
     test_indices = np.random.choice(len(X1), n_test, replace=False)
     
     X1_test = X1[test_indices, -d1:]
     X2_test = X2[test_indices]
     
-    predictions = []
-    for x1 in X1_test:
-        pred = brenier.predict(x1)
-        predictions.append(pred)
-    
-    predictions = np.array(predictions)
+    # [OPT-3] batch predict — uma chamada para todas as n_test queries
+    predictions = brenier.predict(X1_test)   # (n_test, d2)
     
     mse_return = np.mean((predictions[:, 0] - X2_test[:, 0])**2)
     mse_vol = np.mean((predictions[:, 1] - X2_test[:, 1])**2)
@@ -675,7 +601,7 @@ if __name__ == "__main__":
     w2_error = brenier.compute_wasserstein_error(X1_test, X2_test)
     print(f"\n Wasserstein-2 Error: {w2_error:.6f}")
     
-    #Demonstration; Scenarios
+    # Demonstration Scenarios
 
     vol_feature_idx = data['lookback']
     realized_vols = X1_raw[:, vol_feature_idx]
@@ -705,10 +631,10 @@ if __name__ == "__main__":
         print(f"Predicted Drawdown: {prediction['mean_drawdown']:.4f} "
               f"(true: {true_values[2]:.4f})")
     
-    #Visualizations
+    # Visualizations
     fig = plt.figure(figsize=(18, 12))
     
-    #Plot 1: Price comparison
+    # Plot 1: Price comparison
     ax1 = plt.subplot(3, 4, 1)
     x_pos = np.arange(len(strikes))
     width = 0.35
@@ -722,7 +648,7 @@ if __name__ == "__main__":
     ax1.legend(fontsize=9)
     ax1.grid(True, alpha=0.3, axis='y')
     
-    #Plot 2: SVI drift function
+    # Plot 2: SVI drift function
     ax2 = plt.subplot(3, 4, 2)
     k_range = np.linspace(-0.3, 0.3, 100)
     a, b, rho_svi, m, sigma_svi = svi_params
@@ -737,7 +663,7 @@ if __name__ == "__main__":
     ax2.set_title('SVI Drift Function', fontsize=11, fontweight='bold')
     ax2.grid(True, alpha=0.3)
     
-    #Plot 3: IV comparison
+    # Plot 3: IV comparison
     ax3 = plt.subplot(3, 4, 3)
     model_vols = np.array([
         black_scholes_iv(heston_params['S0'], K, T, price)
@@ -755,7 +681,7 @@ if __name__ == "__main__":
     ax3.legend(fontsize=9)
     ax3.grid(True, alpha=0.3)
     
-    #Plot 4: Calibration errors
+    # Plot 4: Calibration errors
     ax4 = plt.subplot(3, 4, 4)
     ax4.plot(strikes, errors, 'o-', linewidth=2, markersize=8, color='red')
     ax4.fill_between(strikes, 0, errors, alpha=0.3, color='red')
@@ -764,7 +690,7 @@ if __name__ == "__main__":
     ax4.set_title(f'SVI Errors (MAE={mae:.4f})', fontsize=11, fontweight='bold')
     ax4.grid(True, alpha=0.3)
     
-    #Plot 5: Return prediction
+    # Plot 5: Return prediction
     ax5 = plt.subplot(3, 4, 5)
     ax5.scatter(X2_test[:, 0], predictions[:, 0], alpha=0.4, s=15)
     lim_min = min(X2_test[:, 0].min(), predictions[:, 0].min())
@@ -778,7 +704,7 @@ if __name__ == "__main__":
     ax5.legend(fontsize=9)
     ax5.grid(True, alpha=0.3)
     
-    #Plot 6: Volatility prediction
+    # Plot 6: Volatility prediction
     ax6 = plt.subplot(3, 4, 6)
     ax6.scatter(X2_test[:, 1], predictions[:, 1], alpha=0.4, s=15, color='green')
     lim_min = min(X2_test[:, 1].min(), predictions[:, 1].min())
@@ -791,7 +717,7 @@ if __name__ == "__main__":
                   fontsize=11, fontweight='bold')
     ax6.grid(True, alpha=0.3)
     
-    #Plot 7: Drawdown prediction
+    # Plot 7: Drawdown prediction
     ax7 = plt.subplot(3, 4, 7)
     ax7.scatter(X2_test[:, 2], predictions[:, 2], alpha=0.4, s=15, color='purple')
     lim_min = min(X2_test[:, 2].min(), predictions[:, 2].min())
@@ -804,7 +730,7 @@ if __name__ == "__main__":
                   fontsize=11, fontweight='bold')
     ax7.grid(True, alpha=0.3)
     
-    #Plot 8: Prediction errors
+    # Plot 8: Prediction errors
     ax8 = plt.subplot(3, 4, 8)
     return_errors = predictions[:, 0] - X2_test[:, 0]
     ax8.hist(return_errors, bins=30, alpha=0.7, color='steelblue', edgecolor='black')
@@ -875,7 +801,7 @@ W₂ Error: {w2_error:.6f}
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\n Saved: {output_file}")
     
-    #Conditional Distributions
+    # Conditional Distributions
     
     fig2 = plt.figure(figsize=(15, 5))
     
@@ -916,37 +842,49 @@ W₂ Error: {w2_error:.6f}
     plt.savefig(output_file2, dpi=150, bbox_inches='tight')
     print(f"Saved: {output_file2}")
     
-    #Convergence Analysis
+    # Convergence Analysis
     
-    sample_sizes = [500, 1000, 2000, 3000, len(X1)]
-    t_values = [0.1 * (n ** (-1/3)) for n in sample_sizes]
+    # Held-out test set
+    n_conv_test = 300
+    all_idx = np.arange(len(X1))
+    conv_test_idx = np.random.choice(all_idx, n_conv_test, replace=False)
+    conv_pool = np.setdiff1d(all_idx, conv_test_idx)   # training pool
+
+    X1_conv_test  = X1[conv_test_idx, -d1:]
+    X2_conv_test  = X2[conv_test_idx]
+
+    max_n        = len(conv_pool)
+    sample_sizes = [s for s in [500, 1000, 2000] if s <= max_n]
+    if max_n not in sample_sizes:
+        sample_sizes.append(max_n)
+    t_values       = [0.1 * (n ** (-1/3)) for n in sample_sizes]
     epsilon_values = [t**2 for t in t_values]
-    
+
     print(f"\n Testing theoretical rate: error ∝ n^(-2/3)")
-    
-    errors_by_size = []
-    
-    for n, t_param, eps_param in zip(sample_sizes, t_values, epsilon_values):
-        print(f"\n    n={n}, t={t_param:.4f}, ε={eps_param:.6f}")
-        
-        indices = np.random.choice(len(X1), min(n, len(X1)), replace=False)
-        X1_sub = X1[indices, -d1:]
-        X2_sub = X2[indices]
-        
-        brenier_temp = ConditionalBrenierEstimator(d1=d1, d2=3, 
-                                                    t=t_param, epsilon=eps_param)
-        brenier_temp.fit(X1_sub, X2_sub)
-        
-        test_indices = np.random.choice(len(X1), 200, replace=False)
-        X1_test_conv = X1[test_indices, -d1:]
-        X2_test_conv = X2[test_indices]
-        
-        w2_error_temp = brenier_temp.compute_wasserstein_error(
-            X1_test_conv, X2_test_conv
+    print(f"  Held-out test: {n_conv_test} samples (disjoint from training)")
+
+    def _fit_and_eval(n, t_param, eps_param, X1, X2, d1):
+        train_idx = np.random.choice(conv_pool, min(n, len(conv_pool)), replace=False)
+        X1_sub = X1[train_idx, -d1:]
+        X2_sub = X2[train_idx]
+        b_temp = ConditionalBrenierEstimator(d1=d1, d2=3, t=t_param, epsilon=eps_param)
+        b_temp.fit(X1_sub, X2_sub)
+        return b_temp.compute_wasserstein_error(X1_conv_test, X2_conv_test)
+
+    try:
+        from joblib import Parallel, delayed
+        errors_by_size = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(_fit_and_eval)(n, t, e, X1, X2, d1)
+            for n, t, e in zip(sample_sizes, t_values, epsilon_values)
         )
-        errors_by_size.append(w2_error_temp)
-        
-        print(f"W₂ error: {w2_error_temp:.6f}")
+    except Exception:
+        errors_by_size = [
+            _fit_and_eval(n, t, e, X1, X2, d1)
+            for n, t, e in zip(sample_sizes, t_values, epsilon_values)
+        ]
+
+    for n, err in zip(sample_sizes, errors_by_size):
+        print(f"n={n}: W₂ error={err:.6f}")
     
     #Plot convergence
     fig3 = plt.figure(figsize=(10, 6))
@@ -973,13 +911,13 @@ W₂ Error: {w2_error:.6f}
     plt.savefig(output_file3, dpi=150, bbox_inches='tight')
     print(f"\n Saved: {output_file3}")
     
-#summary
+# summary
     
-    print(f"\n✅ SVI Drift Calibration:")
+    print(f"\n SVI Drift Calibration:")
     print(f"Parameters: a={svi_params[0]:.4f}, b={svi_params[1]:.4f}, "
           f"ρ={svi_params[2]:.4f}, m={svi_params[3]:.4f}, σ={svi_params[4]:.4f}")
     print(f" Price fitting MAE: {mae:.4f}")
-    print(f"   • Calibration time: {svi_time:.1f}s ({n_cpus} CPUs)")
+    print(f"Calibration time: {svi_time:.1f}s ({n_cpus} CPUs)")
     
     print(f"\n Conditional Price Prediction:")
     print(f"Method: Entropic Optimal Transport")

@@ -1,0 +1,35 @@
+# Hyperparameters for synthetic Heston experiments
+# Used by experiments/generate_synthetic_data.py
+
+heston:
+  S0:    100.0
+  v0:    0.04  # initial variance (σ₀ ≈ 20%)
+  kappa: 2.0   # mean-reversion speed
+  theta: 0.04  # long-term variance
+  sigma: 0.3   # vol-of-vol
+  rho:   -0.7  # spot-vol correlation
+  r:     0.0   # risk-free rate
+
+surface:
+  strikes_norm: # K/S0 grid
+    start: 0.80
+    stop:  1.20
+    n:     21
+  maturities: [0.25, 0.50, 0.75, 1.00]  # years
+  n_paths_surface: 50000
+
+prediction:
+  n_samples:  3000
+  lookback:   20    # past return window (trading days)
+  horizon:    5     # forecast horizon (trading days)
+  features:   full  # 'full' or 'basic'
+
+brenier:
+  method:  theory  # 'theory' (t ∝ n^-1/3) or 'practical'
+  # t and epsilon are auto-computed from n_samples when not set
+  # t: null
+  # epsilon: null
+
+output:
+  filename: unified_heston_prediction_data.npz
+  data_dir: data/synthetic

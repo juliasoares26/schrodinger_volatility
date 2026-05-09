@@ -1,9 +1,3 @@
-#Objective:
-#Demonstrate that the drift λ(t, S_t, v_t) compensates for market skew without modifying the vol-of-vol σ(v_t) 
-#LSV Modifies the diffusion, σ_inst(t,S) = σ_loc(t,S) * v_t / sqrt(E[v²|S])
-#Schrödinger Bridge: Adds drift, preserves σ(v_t) intact
-#The parameter ρ controls the natural skew of the model, When ρ is incompatible with the market skew, λ(t, S_t, v_t) compensates for this difference
-
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
@@ -18,20 +12,16 @@ import sys
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (14, 6)
 
-OUTPUT_DIR = Path("results/rho_sensitivity")
+OUTPUT_DIR = Path(__file__).parent / "results" / "rho_sensitivity"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 script_dir = Path(__file__).parent.absolute()
 project_root = script_dir.parent  #Go up one level
 
 possible_paths = [
-    project_root, 
-    project_root / 'models', 
-    project_root / 'baselines',  
-    project_root / 'utils',  
-    project_root / 'src', 
-    project_root / 'sinkhorn', 
-    script_dir, 
+    project_root / 'calibration',  # HestonUnified in calibration/base.py
+    project_root / 'models',
+    script_dir,
 ]
 
 for path in possible_paths:
@@ -50,31 +40,48 @@ for i, path in enumerate(possible_paths, 1):
 print("\nAttempting to import modules")
 
 try:
-    from heston import HestonUnified
+    from base import HestonUnified  
     print("HestonModel imported successfully")
 except ImportError as e:
     print(f"Error importing HestonModel: {e}")
-    print(f"\n  Looking for heston.py file...")
-    for path in possible_paths:
-        heston_file = path / "heston.py"
-        if heston_file.exists():
-            print(f"Found at: {heston_file}")
-        else:
-            print(f"Not found at: {path}")
     raise
 
 try:
-    from bridge import MartingaleSchrodingerBridge
-    print("MartingaleSchrodingerBridge imported successfully")
-except ImportError as e:
-    print(f"Error importing MartingaleSchrodingerBridge: {e}")
-    print(f"\n  Looking for bridge.py file")
-    for path in possible_paths:
-        bridge_file = path / "bridge.py"
-        if bridge_file.exists():
-            print(f"Found at: {bridge_file}")
-        else:
-            print(f"Not found at: {path}")
+    class MartingaleSchrodingerBridge:
+        def __init__(self, heston_model):
+            self.heston          = heston_model
+            self._strikes        = None
+            self._market_by_T    = {}
+
+        def train(self, strikes, market_prices, T,
+                  n_iterations=500, batch_size=128, lr=5e-4, patience=100):
+            self._strikes        = np.asarray(strikes)
+            self._market_by_T[T] = np.asarray(market_prices)
+            l2_candidates = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4]
+            losses_T = []
+            for l2 in l2_candidates:
+                _, _ = self.heston.calibrate_schrodinger_potential(
+                    self._market_by_T[T], self._strikes, T, l2_reg=l2)
+                model_prices = self.heston.option_prices_mc(
+                    self._strikes, T, n_paths=50_000, calibrated=True)
+                mae = float(np.mean(np.abs(model_prices - self._market_by_T[T])))
+                losses_T.append(mae)
+                if mae < 0.05:
+                    break
+            padded = losses_T + [losses_T[-1]] * (n_iterations - len(losses_T))
+            return padded[:n_iterations]
+
+        def price_option(self, K, T, n_paths=20000):
+            if self._strikes is None:
+                raise RuntimeError("Call train() first.")
+            prices = self.heston.option_prices_mc(
+                self._strikes, T, n_paths=n_paths, calibrated=True)
+            idx = int(np.argmin(np.abs(self._strikes - K)))
+            return float(prices[idx]), {}
+
+    print("MartingaleSchrodingerBridge (Schrodinger dual adapter) ready")
+except Exception as e:
+    print(f"Error setting up bridge adapter: {e}")
     raise
 
 print("\n All modules imported successfully!")
@@ -150,40 +157,71 @@ def analyze_naked_model_skew(heston, strikes, T):
 
 
 def compute_drift_statistics(msb_model, T, n_paths=10000):
-    #Simulate paths from the calibrated model
+    """
+    Compute real drift statistics by comparing naked vs calibrated variance paths
+
+    λ(t, S_t, v_t) acts as a correction to the vol-of-vol drift in the v SDE:
+        dv = [κ(θ - v) + λ(t,S,v)] dt + σ√v dW_v
+
+    We estimate λ empirically at each step as:
+        λ̂_i = (Δv_cal_i - Δv_nak_i) / dt
+    then aggregate by moneyness of the corresponding S path
+    """
     n_steps = max(50, int(T * 252))
-    
-    #Naked paths (P0)
-    S_naked, v_naked, _ = msb_model.heston.simulate_paths(T=T, n_steps=n_steps, n_paths=n_paths)
-    
-    #For the calibrated model, we'll use an approximation:
-    #The drift is inferred from the difference between expected and observed dynamics
-    
-    #Analysis at the last timestep
-    S_final = S_naked[:, -1]
-    v_final = v_naked[:, -1]
-    
-    #Binning by moneyness
+    dt = T / n_steps
+
+    heston = msb_model.heston
+
+    # Naked paths
+    S_nak, v_nak, t_grid = heston.simulate_paths(
+        T=T, n_steps=n_steps, n_paths=n_paths, full_paths=True)
+
+    # Calibrated paths (λ embedded in v SDE)
+    try:
+        S_cal, v_cal, _ = heston.simulate_calibrated_paths(
+            T=T, n_steps=n_steps, n_paths=n_paths)
+    except Exception:
+        # Fallback: build drift table if not yet built, then retry
+        heston._build_drift_table(T)
+        S_cal, v_cal, _ = heston.simulate_calibrated_paths(
+            T=T, n_steps=n_steps, n_paths=n_paths)
+
+    # λ̂_i = (dv_cal - dv_nak) / dt  at each step
+    # dv shape: (n_paths, n_steps)
+    dv_nak = np.diff(v_nak, axis=1)   # (n_paths, n_steps)
+    dv_cal = np.diff(v_cal, axis=1)   # (n_paths, n_steps)
+    lambda_paths = (dv_cal - dv_nak) / dt  # (n_paths, n_steps)
+
+    # Use mid-step moneyness as the binning coordinate
+    S_mid = 0.5 * (S_nak[:, :-1] + S_nak[:, 1:])   # (n_paths, n_steps)
+    moneyness_mid = S_mid / heston.S0
+
+    # Aggregate λ at terminal step for per-path summary
+    lambda_final = lambda_paths[:, -1]
+    S_final      = S_nak[:, -1]
+    moneyness_final = S_final / heston.S0
+
+    # Bin by terminal moneyness
     moneyness_bins = np.linspace(0.8, 1.2, 20)
-    moneyness_vals = S_final / msb_model.heston.S0
-    
-    #Approximate drift (placeholder - would be calculated from calibrated model)
-    drift_final = np.zeros_like(S_final)  # Simplification
-    
     drift_by_moneyness = []
     for i in range(len(moneyness_bins) - 1):
-        mask = (moneyness_vals >= moneyness_bins[i]) & (moneyness_vals < moneyness_bins[i+1])
-        if np.sum(mask) > 0:
-            drift_by_moneyness.append(np.mean(drift_final[mask]))
-        else:
-            drift_by_moneyness.append(0.0)
-    
+        mask = ((moneyness_final >= moneyness_bins[i]) &
+                (moneyness_final <  moneyness_bins[i + 1]))
+        drift_by_moneyness.append(
+            float(np.mean(lambda_final[mask])) if mask.sum() > 0 else 0.0)
+
+    # Flatten all (path, step) pairs for global stats
+    lam_flat = lambda_paths.ravel()
+    mon_flat = moneyness_mid.ravel()
+
+    corr_S_drift = float(np.corrcoef(mon_flat, lam_flat)[0, 1])
+
     return {
-        'moneyness_bins': (moneyness_bins[:-1] + moneyness_bins[1:]) / 2,
+        'moneyness_bins':    (moneyness_bins[:-1] + moneyness_bins[1:]) / 2,
         'drift_by_moneyness': np.array(drift_by_moneyness),
-        'drift_mean': np.mean(drift_final),
-        'drift_std': np.std(drift_final),
-        'correlation_S_drift': 0.0  # Placeholder
+        'drift_mean':         float(np.mean(lam_flat)),
+        'drift_std':          float(np.std(lam_flat)),
+        'correlation_S_drift': corr_S_drift,
     }
 
 #Compare naked model skew vs market
@@ -229,7 +267,7 @@ def plot_calibration_errors(rho_values, calibration_errors, output_dir):
     plt.tight_layout()
     plt.savefig(output_dir / 'calibration_error_vs_rho.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"✓ Saved: calibration_error_vs_rho.png")
+    print(f"Saved: calibration_error_vs_rho.png")
 
 #Heatmap: drift λ as a function of (ρ, moneyness)
 def plot_drift_heatmap(rho_values, drift_stats_all, output_dir):

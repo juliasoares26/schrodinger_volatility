@@ -1,0 +1,33 @@
+# Configuration for backtesting/rolling_calibration.py,
+# prediction_evaluator.py and pnl_simulator.py
+
+rolling_calibration:
+  start: "2022-01-01"
+  end:   "2023-12-31"
+  methods: [particle_filter, gp, svi, msb]
+  maturity_idx: 3   # index into maturities grid
+  n_paths: 20000
+  surfaces_dir: data/processed/surfaces
+
+prediction_eval:
+  train_frac: 0.70   # fraction of samples used for training
+  n_samples:  1000   # MC samples for coverage estimation
+  d1:         7      # conditioning dimension for Brenier
+  brenier:
+    method:  theory  # 'theory' | 'practical'
+    # t and epsilon auto-computed when null
+    t:       null
+    epsilon: null
+
+pnl_simulator:
+  K:             100.0     # option strike (absolute or ATM if 0)
+  T_entry:       1.0       # time-to-maturity at entry (years)
+  r:             0.05      # risk-free rate
+  q:             0.015     # dividend yield
+  atm_vol_entry: 0.20      # fallback BS vol if model IV unavailable
+  use_model_iv:  true
+
+output:
+  store_path:   results/backtest/rolling_store.npz
+  report_dir:   results/backtest
+  title:        "Schrödinger Volatility Backtest Report"

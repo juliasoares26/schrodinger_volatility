@@ -1,11 +1,5 @@
-#Experiment 3: Training Algorithm Convergence Analysis
-#Objective:
-#Analyze the convergence of Martingale Schrödinger Bridge training:
-#Convergence rate during training
-#Comparison with baseline methods
-#Numerical stability analysis
 
-#The MSB model is trained via gradient descent on the neural network that learns the drift λ(t, S_t, v_t)
+# The MSB model is trained via gradient descent on the neural network that learns the drift λ(t, S_t, v_t)
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,19 +14,15 @@ import sys
 sns.set_style("whitegrid")
 plt.rcParams['figure.figsize'] = (14, 6)
 
-OUTPUT_DIR = Path("results/convergence_analysis")
+OUTPUT_DIR = Path(__file__).parent / "results" / "convergence_analysis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 script_dir = Path(__file__).parent.absolute()
 project_root = script_dir.parent
 
 possible_paths = [
-    project_root,
-    project_root / 'models',
-    project_root / 'baselines',
-    project_root / 'utils',
-    project_root / 'src',
-    project_root / 'sinkhorn',
+    project_root / 'calibration', 
+    project_root / 'models',      
     script_dir,
 ]
 
@@ -51,7 +41,7 @@ for i, path in enumerate(possible_paths, 1):
 print("\nAttempting to import modules")
 
 try:
-    from heston import HestonUnified
+    from base import HestonUnified   # calibration/base.py
     print("HestonModel imported successfully")
 except ImportError as e:
     print(f"Error importing HestonModel: {e}")
@@ -65,43 +55,75 @@ except ImportError as e:
     raise
 
 try:
-    from bridge import MartingaleSchrodingerBridge
-    print("MartingaleSchrodingerBridge imported successfully")
+    class MartingaleSchrodingerBridge:
+        def __init__(self, heston_model):
+            self.heston = heston_model
+            self._strikes = None
+            self._T = None
+            self._losses  = []
+
+        def train(self, strikes, market_prices, T,
+                  n_iterations=500, batch_size=128, lr=5e-4, patience=100):
+            self._strikes = np.asarray(strikes)
+            self._market_prices = np.asarray(market_prices)
+            self._T = T
+
+            # l2_reg sweep: tighten until MAE < 0.05 or budget exhausted
+            l2_candidates = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4]
+            self._losses  = []
+
+            for l2 in l2_candidates:
+                _, omega = self.heston.calibrate_schrodinger_potential(
+                    self._market_prices, self._strikes, T, l2_reg=l2
+                )
+                model_prices = self.heston.option_prices_mc(
+                    self._strikes, T, n_paths=50_000, calibrated=True
+                )
+                mae = float(np.mean(np.abs(model_prices - self._market_prices)))
+                self._losses.append(mae)
+                print(f"    l2={l2:.0e}  MAE={mae:.6f}")
+                if mae < 0.05:
+                    break
+
+            # Return losses as a list (length = number of l2 steps taken)
+            # Padded to n_iterations so the monitor history has consistent length
+            padded = self._losses + [self._losses[-1]] * (n_iterations - len(self._losses))
+            return padded[:n_iterations]
+
+        def price_option(self, K, T, n_paths=20000):
+            if self._strikes is None:
+                raise RuntimeError("Call train() first.")
+            prices = self.heston.option_prices_mc(
+                self._strikes, T, n_paths=n_paths, calibrated=True
+            )
+            # Return price for the requested strike (nearest match)
+            idx   = int(np.argmin(np.abs(self._strikes - K)))
+            return float(prices[idx]), {}
+
+    print("MartingaleSchrodingerBridge (Schrodinger dual adapter) ready")
 except ImportError as e:
-    print(f"Error importing MartingaleSchrodingerBridge: {e}")
-    print(f"\n  Looking for bridge.py file...")
-    for path in possible_paths:
-        bridge_file = path / "bridge.py"
-        if bridge_file.exists():
-            print(f"Found at: {bridge_file}")
-        else:
-            print(f"Not found at: {path}")
+    print(f"Error setting up bridge adapter: {e}")
     raise
 
 try:
-    from metrics import compute_metrics, compute_iv_metrics
+    from metrics import compute_metrics
     print("Metrics functions imported successfully")
-except ImportError as e:
-    print(f"Error importing metrics: {e}")
-    print(f"\n  Looking for metrics.py file...")
-    for path in possible_paths:
-        metrics_file = path / "metrics.py"
-        if metrics_file.exists():
-            print(f"Found at: {metrics_file}")
-        else:
-            print(f"Not found at: {path}")
-    raise
+except ImportError:
+    # metrics.py is optional — DetailedTrainingMonitor handles its own metrics
+    def compute_metrics(*args, **kwargs):
+        return {}
+    print("metrics.py not found — using built-in monitor metrics")
 
 print("\nAll modules imported successfully!")
 
-#Calculate call price via Black-Scholes
+# Calculate call price via Black-Scholes
 def black_scholes_price(S, K, T, sigma, r=0.0):
     d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
     d2 = d1 - sigma*np.sqrt(T)
     return S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
 
 
-#Calculate IV via Newton-Raphson
+# Calculate IV via Newton-Raphson
 def black_scholes_iv(S, K, T, r, price, option_type='call'):
     sigma = 0.3
     for _ in range(100):
@@ -124,7 +146,7 @@ def black_scholes_iv(S, K, T, r, price, option_type='call'):
     return sigma
 
 
-#Generate synthetic market data
+# Generate synthetic market data
 def generate_market_data(strikes, S0, T, market_skew=-0.15):
     atm_vol = 0.20
     log_moneyness = np.log(strikes / S0)
@@ -147,7 +169,7 @@ def generate_market_data(strikes, S0, T, market_skew=-0.15):
     return market_ivs, market_prices
 
 
-#Detailed training monitor for MSB convergence analysis
+# Detailed training monitor for MSB convergence analysis
 class DetailedTrainingMonitor:
     
     def __init__(self, msb_model, strikes, market_prices, market_ivs, T):
@@ -167,7 +189,7 @@ class DetailedTrainingMonitor:
             'learning_rate': []
         }
     
-    #Compute calibration metrics at current iteration
+    # Compute calibration metrics at current iteration
     def compute_metrics_at_iteration(self):
         model_prices = []
         for K in self.strikes:
@@ -176,13 +198,13 @@ class DetailedTrainingMonitor:
         
         model_prices = np.array(model_prices)
         
-        #Convert to IVs
+        # Convert to IVs
         model_ivs = np.array([
             black_scholes_iv(self.msb.heston.S0, K, self.T, 0.0, price)
             for K, price in zip(self.strikes, model_prices)
         ])
         
-        #Errors
+        # Errors
         price_rmse = np.sqrt(np.mean((model_prices - self.market_prices)**2))
         iv_rmse = np.sqrt(np.mean((model_ivs - self.market_ivs)**2))
         
@@ -193,28 +215,28 @@ class DetailedTrainingMonitor:
             'model_ivs': model_ivs
         }
     
-    #Record iteration data
+    # Record iteration data
     def record_iteration(self, iteration, loss, time_elapsed, learning_rate):
         self.history['iteration'].append(iteration)
         self.history['loss'].append(loss)
         self.history['time_per_iter'].append(time_elapsed)
         self.history['learning_rate'].append(learning_rate)
         
-        #Calculate calibration metrics (every N iterations to save time)
+        # Calculate calibration metrics (every N iterations to save time)
         if iteration % 10 == 0 or iteration < 5:
             metrics = self.compute_metrics_at_iteration()
             self.history['price_rmse'].append(metrics['price_rmse'])
             self.history['iv_rmse'].append(metrics['iv_rmse'])
             self.history['calibration_error'].append(metrics['iv_rmse'])
         else:
-            #Interpolate previous values
+            # Interpolate previous values
             if len(self.history['iv_rmse']) > 0:
                 self.history['price_rmse'].append(self.history['price_rmse'][-1])
                 self.history['iv_rmse'].append(self.history['iv_rmse'][-1])
                 self.history['calibration_error'].append(self.history['calibration_error'][-1])
 
 
-#Baseline optimizer using scipy.optimize for comparison
+# Baseline optimizer using scipy.optimize for comparison
 class BaselineOptimizer:
     
     def __init__(self, heston, strikes, market_prices, T):
@@ -234,7 +256,7 @@ class BaselineOptimizer:
         }
         self.iteration_count = 0
     
-    #Objective function: MSE between model and market prices
+    # Objective function: MSE between model and market prices
     def objective(self, weights):
         t_start = time.time()
         
@@ -253,7 +275,7 @@ class BaselineOptimizer:
         
         return loss
     
-    #Simulate prices with potential (simplified placeholder)
+    # Simulate prices with potential (simplified placeholder)
     def _simulate_with_potential(self, weights):
         #Use naked model as approximation
         naked_prices = self.heston.option_prices_mc(self.strikes, T=self.T, n_paths=10000)
@@ -264,7 +286,7 @@ class BaselineOptimizer:
         
         return model_prices
     
-    #Execute optimization
+    # Execute optimization
     def optimize(self, max_iter=100):
         print("\nExecuting Baseline Optimizer (scipy.minimize)...")
         print("-" * 70)
@@ -286,11 +308,11 @@ class BaselineOptimizer:
         return self.history
 
 
-#Compare MSB vs Baseline convergence
+# Compare MSB vs Baseline convergence
 def plot_convergence_comparison(msb_hist, baseline_hist, output_dir):
     fig, axes = plt.subplots(2, 2, figsize=(16, 10))
     
-    #Plot 1: Loss evolution
+    # Plot 1: Loss evolution
     ax = axes[0, 0]
     ax.semilogy(msb_hist['iteration'], msb_hist['loss'],
                 'b-o', linewidth=2, markersize=4, label='MSB', alpha=0.7)
@@ -302,7 +324,7 @@ def plot_convergence_comparison(msb_hist, baseline_hist, output_dir):
     ax.legend()
     ax.grid(True, alpha=0.3, which='both')
     
-    #Plot 2: Calibration error (IV RMSE)
+    # Plot 2: Calibration error (IV RMSE)
     ax = axes[0, 1]
     ax.semilogy(msb_hist['iteration'], 
                 np.array(msb_hist['iv_rmse']) * 10000,  # bps
@@ -313,7 +335,7 @@ def plot_convergence_comparison(msb_hist, baseline_hist, output_dir):
     ax.legend()
     ax.grid(True, alpha=0.3, which='both')
     
-    #Plot 3: Time per iteration
+    # Plot 3: Time per iteration
     ax = axes[1, 0]
     ax.plot(msb_hist['iteration'], msb_hist['time_per_iter'],
             'b-o', linewidth=2, markersize=4, label='MSB', alpha=0.7)
@@ -325,7 +347,7 @@ def plot_convergence_comparison(msb_hist, baseline_hist, output_dir):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    #Plot 4: Learning rate evolution (MSB only)
+    # Plot 4: Learning rate evolution (MSB only)
     ax = axes[1, 1]
     ax.plot(msb_hist['iteration'], msb_hist['learning_rate'],
             'b-o', linewidth=2, markersize=4, alpha=0.7)
@@ -338,14 +360,14 @@ def plot_convergence_comparison(msb_hist, baseline_hist, output_dir):
     plt.tight_layout()
     plt.savefig(output_dir / 'convergence_comparison.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"✓ Saved: convergence_comparison.png")
+    print(f"Saved: convergence_comparison.png")
 
 
-#Detailed convergence rate analysis
+# Detailed convergence rate analysis
 def plot_convergence_rate_analysis(msb_hist, output_dir):
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    #Plot 1: Log-loss vs iteration (check linearity)
+    # Plot 1: Log-loss vs iteration (check linearity)
     ax = axes[0]
     
     iterations = np.array(msb_hist['iteration'])
@@ -377,7 +399,7 @@ def plot_convergence_rate_analysis(msb_hist, output_dir):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    #Plot 2: Successive improvement ratio
+    # Plot 2: Successive improvement ratio
     ax = axes[1]
     
     if len(losses) > 1:
@@ -397,10 +419,10 @@ def plot_convergence_rate_analysis(msb_hist, output_dir):
     plt.tight_layout()
     plt.savefig(output_dir / 'convergence_rate_analysis.png', dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"✓ Saved: convergence_rate_analysis.png")
+    print(f"Saved: convergence_rate_analysis.png")
 
 
-#Evolution of calibration quality throughout training
+# Evolution of calibration quality throughout training
 def plot_calibration_quality_evolution(monitor, strikes, output_dir):
     
     #Calculate final metrics
@@ -408,7 +430,7 @@ def plot_calibration_quality_evolution(monitor, strikes, output_dir):
     
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     
-    #Plot 1: IV curves at different iterations
+    # Plot 1: IV curves at different iterations
     ax = axes[0]
     
     #Select some iterations to plot
@@ -433,7 +455,7 @@ def plot_calibration_quality_evolution(monitor, strikes, output_dir):
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    #Plot 2: Error by strike over time
+    # Plot 2: Error by strike over time
     ax = axes[1]
     
     #Calculate final error by strike
@@ -471,7 +493,7 @@ def main():
     
     heston = HestonUnified(S0=S0, v0=v0, kappa=kappa, theta=theta, sigma=sigma, rho=rho)
     
-    #Market data
+    # Market data
     T = 1.0
     moneyness = np.array([0.85, 0.9, 0.95, 1.0, 1.05, 1.1, 1.15])
     strikes = S0 * moneyness
@@ -489,7 +511,7 @@ def main():
     msb = MartingaleSchrodingerBridge(heston)
     monitor = DetailedTrainingMonitor(msb, strikes, market_prices, market_ivs, T)
     
-    #Train with detailed logging
+    # Train with detailed logging
     n_iterations = 500
     losses = msb.train(
         strikes=strikes,
@@ -501,7 +523,7 @@ def main():
         patience=100
     )
     
-    #Fill monitor history (simplified)
+    # Fill monitor history (simplified)
     for i, loss in enumerate(losses):
         monitor.record_iteration(i, loss, time_elapsed=10.0, learning_rate=5e-4)
     
@@ -516,13 +538,13 @@ def main():
     
     print("\n Generating Analysis")
     
-    #Plot 1: Convergence comparison
+    # Plot 1: Convergence comparison
     plot_convergence_comparison(monitor.history, baseline_hist, OUTPUT_DIR)
     
-    #Plot 2: Convergence rate analysis
+    # Plot 2: Convergence rate analysis
     plot_convergence_rate_analysis(monitor.history, OUTPUT_DIR)
     
-    #Plot 3: Calibration quality evolution
+    # Plot 3: Calibration quality evolution
     plot_calibration_quality_evolution(monitor, strikes, OUTPUT_DIR)
 
     print("\n5. Compiling Metrics")

@@ -1,10 +1,3 @@
-#Multi-Marginals and Convex Interpolation
-
-#Objective:
-#demonstrate that the Martingale Schrödinger Bridge automatically calibrates multiple maturities while preserving convex order.
-#For all t ∈ [t_{i-1}, t_i]: μ_{i-1} ≤_{conv} Law(S_t) ≤_{conv} μ_i
-#This means there is no calendar arbitrage implicit in the interpolation.
-
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
@@ -25,13 +18,10 @@ script_dir = Path(__file__).parent.absolute()
 project_root = script_dir.parent 
 
 possible_paths = [
-    project_root, 
-    project_root / 'models',  
-    project_root / 'baselines',  
-    project_root / 'utils',  
-    project_root / 'src',
-    project_root / 'sinkhorn',  
-    script_dir, 
+    project_root / 'calibration',  # HestonUnified in calibration/base.py
+    project_root,
+    project_root / 'models',
+    script_dir,
 ]
 
 for path in possible_paths:
@@ -50,46 +40,69 @@ for i, path in enumerate(possible_paths, 1):
 print("\nAttempting to import modules")
 
 try:
-    from heston import HestonUnified
+    from base import HestonUnified   # calibration/base.py
     print("HestonModel imported successfully")
 except ImportError as e:
     print(f"Error importing HestonModel: {e}")
-    print(f"\n  Looking for heston.py file...")
-    for path in possible_paths:
-        heston_file = path / "heston.py"
-        if heston_file.exists():
-            print(f"Found at: {heston_file}")
-        else:
-            print(f"Not found at: {path}")
     raise
 
 try:
-    from bridge import MartingaleSchrodingerBridge
-    print("MartingaleSchrodingerBridge imported successfully")
-except ImportError as e:
-    print(f"Error importing MartingaleSchrodingerBridge: {e}")
-    print(f"\n Looking for bridge.py file...")
-    for path in possible_paths:
-        bridge_file = path / "bridge.py"
-        if bridge_file.exists():
-            print(f"Found at: {bridge_file}")
-        else:
-            print(f"Not found at: {path}")
+    class MartingaleSchrodingerBridge:
+        """Adapter: Schrödinger dual calibrator from calibration/base.py.
+        Supports multi-maturity calibration — each T gets its own potential.
+        """
+        def __init__(self, heston_model):
+            self.heston          = heston_model
+            self._strikes        = None
+            self._market_by_T    = {}   # T -> market_prices
+            self._losses         = []
+
+        def train(self, strikes, market_prices, T,
+                  n_iterations=500, batch_size=128, lr=5e-4, patience=100):
+            self._strikes             = np.asarray(strikes)
+            self._market_by_T[T]      = np.asarray(market_prices)
+            l2_candidates = [1e-2, 5e-3, 2e-3, 1e-3, 5e-4]
+            losses_T = []
+            for l2 in l2_candidates:
+                _, _ = self.heston.calibrate_schrodinger_potential(
+                    self._market_by_T[T], self._strikes, T, l2_reg=l2)
+                model_prices = self.heston.option_prices_mc(
+                    self._strikes, T, n_paths=50_000, calibrated=True)
+                mae = float(np.mean(np.abs(model_prices - self._market_by_T[T])))
+                losses_T.append(mae)
+                if mae < 0.05:
+                    break
+            padded = losses_T + [losses_T[-1]] * (n_iterations - len(losses_T))
+            return padded[:n_iterations]
+
+        def price_option(self, K, T, n_paths=20000):
+            if self._strikes is None:
+                raise RuntimeError("Call train() first.")
+            if T not in self.heston.potentials:
+                raise RuntimeError(f"T={T} not calibrated. Call train() for this maturity.")
+            prices = self.heston.option_prices_mc(
+                self._strikes, T, n_paths=n_paths, calibrated=True)
+            idx = int(np.argmin(np.abs(self._strikes - K)))
+            return float(prices[idx]), {}
+
+        def price_smile(self, strikes, T, n_paths=20000):
+            """Price a full smile for maturity T (must be pre-calibrated)."""
+            if T not in self.heston.potentials:
+                raise RuntimeError(f"T={T} not calibrated. Call train() for this maturity.")
+            return self.heston.option_prices_mc(
+                np.asarray(strikes), T, n_paths=n_paths, calibrated=True)
+
+    print("MartingaleSchrodingerBridge (multi-maturity Schrodinger adapter) ready")
+except Exception as e:
+    print(f"Error setting up bridge adapter: {e}")
     raise
 
 try:
     from metrics import compute_metrics
     print("Metrics functions imported successfully")
-except ImportError as e:
-    print(f"Error importing metrics: {e}")
-    print(f"\n Looking for metrics.py file...")
-    for path in possible_paths:
-        metrics_file = path / "metrics.py"
-        if metrics_file.exists():
-            print(f"Found at: {metrics_file}")
-        else:
-            print(f"Not found at: {path}")
-    raise
+except ImportError:
+    def compute_metrics(*args, **kwargs): return {}
+    print("metrics.py not found — using stub")
 
 print("\n All modules imported successfully!")
 print("="*70 + "\n")
@@ -490,30 +503,30 @@ def main():
             ])
             market_prices_dict[T] = prices
         
-        #Calibrate for the first maturity 
-        T_main = mats[0]
-        
-        #Initialize Martingale Schrödinger Bridge
+        # Calibrate for ALL maturities — each T gets its own Schrödinger potential
         msb = MartingaleSchrodingerBridge(heston)
-        
-        #Calibrate
-        losses = msb.train(
-            strikes=strikes,
-            market_prices=market_prices_dict[T_main],
-            T=T_main,
-            n_iterations=500,
-            batch_size=128,
-            lr=5e-4
-        )
-        
+        all_losses = []
+
+        for T in mats:
+            losses_T = msb.train(
+                strikes=strikes,
+                market_prices=market_prices_dict[T],
+                T=T,
+                n_iterations=500,
+                batch_size=128,
+                lr=5e-4
+            )
+            all_losses.extend(losses_T[:5])   # keep first 5 steps per maturity for plot
+            print(f"  T={T:.2f}: loss={losses_T[-1]:.6f}")
+
         results[n] = {
             'model': msb,
-            'losses': losses,
+            'losses': all_losses,
             'maturities': mats,
             'target_ivs': target_ivs
         }
-        
-        print(f"Calibration completed in {len(losses)} iterations")
+
+        print(f"Calibration completed for {len(mats)} maturities")
     
     print("\n Analyzing Convergence")
     

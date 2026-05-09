@@ -4,16 +4,19 @@ from sklearn.gaussian_process.kernels import RBF, Matern, ConstantKernel
 from scipy.optimize import minimize
 from scipy.stats import norm
 from scipy.stats.qmc import LatinHypercube
-from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 import time
 from tqdm import tqdm
 from pathlib import Path
 import sys
 
-#Import HestonModel
+# HestonUnified lives in base.py (same calibration folder)
+sys.path.append(str(Path(__file__).parent))
+from base import HestonUnified
+
+# ConditionalBrenierEstimator lives in models/brenier.py
 sys.path.append(str(Path(__file__).parent.parent / 'models'))
-from heston import HestonUnified
+from brenier import ConditionalBrenierEstimator
 
 def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3):
     script_dir = Path(__file__).parent.absolute()
@@ -45,141 +48,8 @@ def find_data_file(filename='unified_heston_prediction_data.npz', search_depth=3
     print(f"File not found")
     return None
 
-class ConditionalBrenierEstimator:
 
-    #d1 : int - Dimension of conditioning variables
-    #d2 : int - Dimension of target variables
-    #t : float - Rescaling parameter - t ∝ n^(-1/3)
-    #epsilon : float - Entropic regularization - ε ∝ t²
-
-    def __init__(self, d1: int, d2: int, t: float = 0.01, epsilon: float = 0.001):
-        self.d1 = d1
-        self.d2 = d2
-        self.t = t
-        self.epsilon = epsilon
-        
-        #Rescaling matrix A_t 
-        d = d1 + d2
-        self.A_t = np.eye(d)
-        self.A_t[:d1, :d1] *= 1.0
-        self.A_t[d1:, d1:] *= np.sqrt(t)
-        
-        self.X_train = None
-        self.Y_train = None
-        self.dual_potentials = None
-    
-    
-    #Compute C_ij = ½‖A_t(X_i - Y_j)‖²
-    def compute_rescaled_cost(self, X, Y):
-        X_scaled = X @ self.A_t
-        Y_scaled = Y @ self.A_t
-        C = cdist(X_scaled, Y_scaled, metric='sqeuclidean') / 2.0
-        return C
-    
-    #Sinkhorn algorithm for dual potentials. 
-    #Solves entropic OT: min_π <C,π> + ε·KL(π‖ρ⊗μ)
-    def sinkhorn_dual_potentials(self, C, max_iter=1000, tol=1e-6):
-        n, m = C.shape
-        f = np.zeros(n)
-        g = np.zeros(m)
-        
-        for iteration in range(max_iter):
-            f_old = f.copy()
-            
-            f = -self.epsilon * np.log(
-                np.sum(np.exp((g - C.T) / self.epsilon), axis=1) + 1e-10
-            )
-            
-            g = -self.epsilon * np.log(
-                np.sum(np.exp((f[:, np.newaxis] - C) / self.epsilon), axis=0) + 1e-10
-            )
-            
-            if np.max(np.abs(f - f_old)) < tol:
-                break
-        
-        return g
-    
-    
-    #Fit conditional Brenier map to joint samples (X₁, X₂).
-    #X1 : ndarray, shape (n, d1) - Conditioning variables
-    #X2 : ndarray, shape (n, d2) - Target variables
-
-    def fit(self, X1, X2):
-        print(f"\n  🔧 Fitting Conditional Brenier Map...")
-        print(f"     d1={self.d1}, d2={self.d2}, t={self.t:.4f}, ε={self.epsilon:.4f}")
-        
-        n = X1.shape[0]
-        
-        self.X_train = np.hstack([X1, X2])
-        self.Y_train = np.hstack([X1, X2])
-        
-        C = self.compute_rescaled_cost(self.X_train, self.Y_train)
-        
-        start = time.time()
-        self.dual_potentials = self.sinkhorn_dual_potentials(C)
-        sinkhorn_time = time.time() - start
-        
-        print(f"Fitted on {n} samples ({sinkhorn_time:.1f}s)")
-    
-
-    #Predict X₂ given X₁ via entropic Brenier map
-    #T̂_ε,t(x) = Σᵢ Yᵢ · wᵢ(x)
-    #where wᵢ(x) ∝ exp((gᵢ - ½‖A_t(x-Yᵢ)‖²)/ε)
-
-    def predict(self, x1_query, return_distribution=False, n_samples=1000):
-        x1_query = np.atleast_2d(x1_query)
-        
-        if self.dual_potentials is None:
-            raise ValueError("Model not fitted")
-        
-        x_extended = np.zeros((x1_query.shape[0], self.d1 + self.d2))
-        x_extended[:, :self.d1] = x1_query
-        
-        predictions = []
-        all_samples = [] if return_distribution else None
-        
-        for x in x_extended:
-            x_scaled = self.A_t @ x
-            Y_scaled = self.Y_train @ self.A_t.T
-            
-            distances = np.sum((Y_scaled - x_scaled) ** 2, axis=1) / 2.0
-            
-            #Barycentric weights
-            log_weights = (self.dual_potentials - distances) / self.epsilon
-            log_weights -= np.max(log_weights)
-            weights = np.exp(log_weights)
-            weights /= np.sum(weights)
-            
-            #Conditional mean
-            result = np.sum(self.Y_train * weights[:, np.newaxis], axis=0)
-            predictions.append(result[self.d1:])
-            
-            if return_distribution:
-                indices = np.random.choice(
-                    len(self.Y_train), size=n_samples, p=weights, replace=True
-                )
-                samples = self.Y_train[indices, self.d1:]
-                all_samples.append(samples)
-        
-        prediction = np.array(predictions).squeeze()
-        
-        if return_distribution:
-            return prediction, all_samples[0] if len(all_samples) == 1 else all_samples
-        
-        return prediction
-    
-    def compute_wasserstein_error(self, x1_test, x2_test):
-        #Compute W₂ distance for evaluation 
-        predictions = []
-        for x1 in x1_test:
-            pmred = self.predict(x1)
-            predictions.append(pred)
-        
-        predictions = np.array(predictions)
-        mse = np.mean((predictions - x2_test) ** 2)
-        return np.sqrt(mse)
-
-#Black-scholes implied volatility 
+#Black-scholes implied volatility
 
 #Compute BS call price
 def black_scholes_price(S, K, T, sigma, r=0.0):
@@ -275,76 +145,64 @@ class HestonModelWithDrift:
     def __init__(self, heston_model, n_weights=15):
         self.heston = heston_model
         self.n_weights = n_weights
-    
-    def drift_lambda(self, t, S, v, weights):
-        """Drift function using RBF basis."""
-        if weights is None or len(weights) == 0:
-            return 0.0
-        
+        # Pre-build RBF centers once (avoids recomputing per step)
         S_centers = np.array([0.8, 0.9, 1.0, 1.1, 1.2]) * self.heston.S0
         v_centers = np.array([0.02, 0.04, 0.06])
-        
-        features = []
-        for S_c in S_centers:
-            for v_c in v_centers:
-                rbf = np.exp(-0.5 * (((S - S_c)/20)**2 + ((v - v_c)/0.02)**2))
-                features.append(rbf)
-        
-        return np.dot(weights, np.array(features))
-    
+        self._centers = np.array(
+            [[Sc, vc] for Sc in S_centers for vc in v_centers]
+        )  # (15, 2)
+        self._scales = np.array([20.0, 0.02])
+
+    def _drift_vectorized(self, S_arr, v_arr, weights):
+        """Vectorized RBF drift over all paths at once — shape (n_paths,)."""
+        sv   = np.stack([S_arr, v_arr], axis=1)               # (n, 2)
+        diff = (sv[:, None, :] - self._centers[None, :, :]) / self._scales  # (n, 15, 2)
+        rbf  = np.exp(-0.5 * np.sum(diff ** 2, axis=2))       # (n, 15)
+        return rbf @ weights                                    # (n,)
+
     #Simulate paths with drift on variance
     def simulate_paths_with_drift(self, T, n_steps, n_paths, weights=None):
-        dt = T / n_steps
-        t = np.linspace(0, T, n_steps + 1)
-        
+        dt          = T / n_steps
+        sqrt_1mrho2 = np.sqrt(1.0 - self.heston.rho ** 2)
+        t           = np.linspace(0, T, n_steps + 1)
+
         S = np.zeros((n_paths, n_steps + 1))
         v = np.zeros((n_paths, n_steps + 1))
-        
         S[:, 0] = self.heston.S0
         v[:, 0] = self.heston.v0
-        
+
         for i in range(n_steps):
-            t_curr = t[i]
-            
             Z1 = np.random.randn(n_paths)
             Z2 = np.random.randn(n_paths)
-            
             W1 = Z1
-            W2 = self.heston.rho * Z1 + np.sqrt(1 - self.heston.rho**2) * Z2
-            
+            W2 = self.heston.rho * Z1 + sqrt_1mrho2 * Z2
+
             v_curr = np.maximum(v[:, i], 1e-8)
-            
-            if weights is not None:
-                lambda_drift = np.array([
-                    self.drift_lambda(t_curr, S[j, i], v_curr[j], weights) 
-                    for j in range(n_paths)
-                ])
-            else:
-                lambda_drift = 0.0
-            
+
+            lambda_drift = (
+                self._drift_vectorized(S[:, i], v_curr, weights)
+                if weights is not None else 0.0
+            )
+
             drift_v = self.heston.kappa * (self.heston.theta - v_curr) + lambda_drift
             dv = drift_v * dt + self.heston.sigma * np.sqrt(v_curr * dt) * W2
             v[:, i + 1] = np.maximum(v_curr + dv, 1e-8)
-            
+
             S[:, i + 1] = S[:, i] * np.exp(
                 (self.heston.r - 0.5 * v_curr) * dt + np.sqrt(v_curr * dt) * W1
             )
-        
+
         return S, v, t
-    
-    #Price calls with drift
+
+    #Price calls with drift — all strikes in one broadcast
     def price_calls(self, strikes, T, n_paths=10000, weights=None):
         S, _, _ = self.simulate_paths_with_drift(
             T, n_steps=100, n_paths=n_paths, weights=weights
         )
-        S_T = S[:, -1]
-        
-        prices = []
-        for K in strikes:
-            payoff = np.maximum(S_T - K, 0)
-            prices.append(np.exp(-self.heston.r * T) * np.mean(payoff))
-        
-        return np.array(prices)
+        S_T     = S[:, -1]
+        strikes = np.asarray(strikes)
+        payoffs = np.maximum(S_T[:, None] - strikes[None, :], 0)  # (n_paths, n_strikes)
+        return np.exp(-self.heston.r * T) * payoffs.mean(axis=0)
 
 
 
@@ -397,12 +255,10 @@ class GaussianProcessDriftCalibration:
             loss = 1e6
         return loss
     
-    #MSE loss
+    #Expected Improvement acquisition function
     def expected_improvement(self, weights_norm, y_best):
-        weights = self.denormalize_weights(weights_norm)
-        
         mu, sigma = self.gp.predict(weights_norm.reshape(1, -1), return_std=True)
-        mu = mu[0]
+        mu    = mu[0]
         sigma = sigma[0]
         
         if sigma < 1e-8:
@@ -506,20 +362,35 @@ class HybridGPBrenierMethod:
         
         return best_weights, history, gp_time
     
-    def fit_brenier_map(self, X1, X2, d1, t=0.01, epsilon=0.001):
-        
+    def fit_brenier_map(self, X1, X2, d1, t=None, epsilon=None):
+        """Fit the conditional Brenier map.
+
+        t and epsilon default to the theory-optimal values:
+            t*       = 0.1 * n^(-1/3)
+            epsilon* = t*^2
+        which shrink the bandwidth as n grows and avoids over-smoothing
+        (the main cause of bias in the medium-volatility regime).
+        """
         X1_subset = X1[:, -d1:]
         d2 = X2.shape[1]
-        
+        n  = X1_subset.shape[0]
+
+        if t is None:
+            t = 0.1 * (n ** (-1/3))
+        if epsilon is None:
+            epsilon = t ** 2
+
+        print(f"  Brenier hyperparams: n={n}  t={t:.4f}  epsilon={epsilon:.6f}")
+
         start = time.time()
         self.brenier_estimator = ConditionalBrenierEstimator(
             d1=d1, d2=d2, t=t, epsilon=epsilon
         )
         self.brenier_estimator.fit(X1_subset, X2)
         brenier_time = time.time() - start
-        
+
         print(f"Brenier map fitted ({brenier_time:.1f}s)")
-        
+
         return self.brenier_estimator, brenier_time
     
     #Predict future outcomes
@@ -572,9 +443,9 @@ if __name__ == "__main__":
         strikes, market_prices, T
     )
     
-    #Brenier map
-    d1 = 7
-    brenier, brenier_time = hybrid.fit_brenier_map(X1, X2, d1=d1, t=0.02, epsilon=0.004)
+    #Brenier map — d1=10 for richer conditioning; t/epsilon auto-tuned by theory
+    d1 = 10
+    brenier, brenier_time = hybrid.fit_brenier_map(X1, X2, d1=d1)
     
     print(f"GP calibration: {gp_time:.1f}s")
     print(f"Brenier fitting: {brenier_time:.1f}s")
@@ -860,34 +731,52 @@ W₂ Error: {w2_error:.6f}
     
     #Convergence Analysis
     
-    sample_sizes = [500, 1000, 2000, 3000, len(X1)]
+    # Hold out a fixed test set BEFORE subsampling so that when
+    # n == len(X1) the test queries are disjoint from training.
+    n_conv_test     = 300
+    all_idx         = np.arange(len(X1))
+    conv_test_idx   = np.random.choice(all_idx, n_conv_test, replace=False)
+    conv_train_pool = np.setdiff1d(all_idx, conv_test_idx)
+
+    X1_conv_test = X1[conv_test_idx, -d1:]
+    X2_conv_test = X2[conv_test_idx]
+
+    max_n        = len(conv_train_pool)
+    sample_sizes = [s for s in [500, 1000, 2000] if s <= max_n]
+    if max_n not in sample_sizes:
+        sample_sizes.append(max_n)
+
     t_values = [0.1 * (n ** (-1/3)) for n in sample_sizes]
-    epsilon_values = [t**2 for t in t_values]
-    
+
     print(f"\n Testing theoretical rate: error ∝ n^(-2/3)")
-    
+    print(f"  Held-out test: {n_conv_test} samples (disjoint from training)")
+
     errors_by_size = []
-    
-    for n, t_param, eps_param in zip(sample_sizes, t_values, epsilon_values):
-        print(f"\n    n={n}, t={t_param:.4f}, ε={eps_param:.6f}")
-        
-        indices = np.random.choice(len(X1), min(n, len(X1)), replace=False)
-        X1_sub = X1[indices, -d1:]
-        X2_sub = X2[indices]
-        
-        brenier_temp = ConditionalBrenierEstimator(d1=d1, d2=3, 
-                                                    t=t_param, epsilon=eps_param)
+
+    for n, t_param in zip(sample_sizes, t_values):
+        print(f"\n    n={n}, t={t_param:.4f}")
+
+        # Auto-scale epsilon from the data geometry (same as particle_filter.py)
+        train_idx    = np.random.choice(conv_train_pool, n, replace=False)
+        X1_sub       = X1[train_idx, -d1:]
+        X2_sub       = X2[train_idx]
+
+        d_full        = d1 + X2_sub.shape[1]
+        A_t           = np.eye(d_full)
+        A_t[d1:, d1:] *= np.sqrt(t_param)
+        Z             = np.hstack([X1_sub, X2_sub]) @ A_t
+        mean_sq_dist  = np.mean(np.sum(Z ** 2, axis=1))
+        eps_param     = t_param ** 2 * max(mean_sq_dist, 0.01)
+
+        brenier_temp = ConditionalBrenierEstimator(
+            d1=d1, d2=X2_sub.shape[1], t=t_param, epsilon=eps_param
+        )
         brenier_temp.fit(X1_sub, X2_sub)
-        
-        test_indices = np.random.choice(len(X1), 200, replace=False)
-        X1_test_conv = X1[test_indices, -d1:]
-        X2_test_conv = X2[test_indices]
-        
+
         w2_error_temp = brenier_temp.compute_wasserstein_error(
-            X1_test_conv, X2_test_conv
+            X1_conv_test, X2_conv_test
         )
         errors_by_size.append(w2_error_temp)
-        
         print(f"W₂ error: {w2_error_temp:.6f}")
     
     # Plot convergence
@@ -958,7 +847,7 @@ W₂ Error: {w2_error:.6f}
     plt.savefig(output_file4, dpi=150, bbox_inches='tight')
     print(f"\n Saved: {output_file4}")
 
-    #Summary
+    # Summary
 
     print(f"Kernel: Constant × Matérn(ν=2.5)")
     print(f"Initial samples: {hybrid.gp_calibrator.n_initial} (Latin Hypercube)")
